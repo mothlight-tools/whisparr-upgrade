@@ -1,0 +1,48 @@
+name: Whisparr Upgrade
+description: Request a better-quality version of a scene from Whisparr with one click (the upgraded file is merged back into the scene, keeping markers, rating and play history). Optional one-click delete that also excludes the scene in Whisparr so it is never re-downloaded.
+version: 2.2.0
+exec:
+  - python
+  - "{pluginDir}/whisparr_upgrade.py"
+interface: raw
+ui:
+  javascript:
+    - whisparr_upgrade.js
+  assets:
+    /: assets
+hooks:
+  - name: Upgrade request / merge upgraded file / delete
+    description: Reacts to the Upgrade and Delete tags, and merges upgraded downloads back into the original scene.
+    triggeredBy:
+      - Scene.Update.Post
+      - Scene.Create.Post
+settings:
+  WHISPARR_URL:
+    displayName: Whisparr URL
+    description: Address Stash can reach Whisparr on, e.g. http://localhost:6969
+    type: STRING
+  WHISPARR_KEY:
+    displayName: Whisparr API Key
+    description: Whisparr → Settings → General → API Key
+    type: STRING
+  ENABLE_DELETE:
+    displayName: Enable delete (scene + file + Whisparr exclusion)
+    description: Off by default. When on, a 🗑 button appears and the Delete tag permanently deletes the scene and its file, and excludes it in Whisparr.
+    type: BOOLEAN
+  KEEP_MONITORING:
+    displayName: Keep monitoring after an upgrade arrives
+    description: Off by default - once the better file is in, the scene is unmonitored in Whisparr so it isn't upgraded again or re-downloaded if you delete it. Turn on to let Whisparr keep looking after it.
+    type: BOOLEAN
+  HIDE_BUTTONS:
+    displayName: Hide the ⬆ / 🗑 buttons
+    description: Use the tags only, without buttons on the scene page and player.
+    type: BOOLEAN
+  UPGRADE_TAG:
+    displayName: Upgrade tag (default "Upgrade")
+    type: STRING
+  PENDING_TAG:
+    displayName: Pending tag (default "Upgrade Requested")
+    type: STRING
+  DELETE_TAG:
+    displayName: Delete tag (default "Delete")
+    type: STRING
