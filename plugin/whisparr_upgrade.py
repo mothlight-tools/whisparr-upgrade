@@ -266,7 +266,7 @@ def check_releases(stash, cfg, scene_id):
     top = better[0] if better else None
     return dict(st, better=len(better), bestRes=top["res"] if top else 0, best=top["label"] if top else None,
                 bestSizeGB=top["sizeGB"] if top else None, bestMbps=top["mbps"] if top else None,
-                bestLow=top["low"] if top else False, top=better[:12])
+                bestLow=top["low"] if top else False, top=better[:40])
 
 
 def grab_release(stash, cfg, scene_id, guid, indexer_id):

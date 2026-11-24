@@ -150,6 +150,27 @@
       r.low ? "⚠ low bitrate" : null, r.approved ? "✓ Whisparr's own pick" : null].filter(Boolean).join(" · ");
     return [a, b];
   }
+  // How the release list is ordered. Remembered in this browser and shared with StashPicker.
+  const ORDERS = [["res", "Quality"], ["indexer", "Indexer"], ["small", "Smallest"], ["large", "Largest"], ["seeders", "Seeders"]];
+  const OK_KEY = "mothlight:releaseOrder";
+  function getOrder() { try { const v = localStorage.getItem(OK_KEY); return ORDERS.some((o) => o[0] === v) ? v : "res"; } catch (e) { return "res"; } }
+  function setOrder(v) { try { localStorage.setItem(OK_KEY, v); } catch (e) {} }
+  function sortRel(list, order) {
+    const p = (r) => (r.priority == null ? 25 : r.priority), sz = (r) => r.sizeGB || 0, lo = (r) => (r.low ? 1 : 0);
+    const seed = (r) => (r.protocol === "usenet" ? 1e9 : r.seeders || 0); // usenet is always fully available
+    const key = {
+      res: (r) => [-r.res, lo(r), p(r), -sz(r), -seed(r)],
+      indexer: (r) => [p(r), -r.res, lo(r), -sz(r), -seed(r)],
+      small: (r) => [sz(r), -r.res, p(r)],
+      large: (r) => [-sz(r), -r.res, p(r)],
+      seeders: (r) => [-seed(r), -r.res, lo(r), p(r)],
+    }[order] || ((r) => [-r.res, lo(r), p(r), -sz(r), -seed(r)]);
+    return [...list].sort((a, b) => {
+      const x = key(a), y = key(b);
+      for (let i = 0; i < x.length; i++) if (x[i] !== y[i]) return x[i] < y[i] ? -1 : 1;
+      return 0;
+    });
+  }
   function ago(t) {
     const m = Math.round((Date.now() - t) / 60000);
     return m < 1 ? "just now" : m < 60 ? m + " min ago" : Math.round(m / 60) + " h ago";
@@ -181,8 +202,7 @@
       else if (c.better) {
         lines.push("Found " + c.better + " better release" + (c.better > 1 ? "s" : "") + " (" + ago(chk.at) + "):");
         lines.push("  " + sizeLine(st && st.sizeGB != null ? st : c, c));
-        (c.top || []).forEach((r) => lines.push("  • " + relLines(r).join(" · ") +
-          ""));
+        sortRel(c.top || [], getOrder()).slice(0, 12).forEach((r) => lines.push("  • " + relLines(r).join(" · ")));
       } else lines.push("No better version found (" + ago(chk.at) + ")");
     }
     if (!b._req) {
@@ -262,13 +282,21 @@
       const s = scene || await getScene(w.id);
       if (isRequested(s, c)) return toast(w.host, "Upgrade already requested for this scene");
       const cur = (btn._st && btn._st.sizeGB != null) ? btn._st : data;
-      const opts = (data.top || []).filter((r) => r.guid).map((r) => ({ label: relLines(r).join("\n"), value: r }));
-      opts.push({ label: "⬆  Let Whisparr choose (uses your quality profile)", value: "auto", main: true });
-      opts.push({ label: "Cancel", value: null });
-      const v = await choose(`Pick a version of "${s.title || "this scene"}"`,
-        "Your file: " + cur.current + ", " + gb(cur.sizeGB) + (cur.mbps ? ", ~" + cur.mbps + " Mbps" : "") +
-        "   (checked " + ago(at) + ")\n⚠ = low bitrate for its resolution: often a heavy re-encode, an upscale or a shorter cut.\n" +
-        "The one you pick downloads now and is merged into this scene when it arrives.", opts);
+      let v;
+      for (;;) {
+        const order = getOrder();
+        const opts = ORDERS.map(([k, name]) => ({ label: name, value: { sort: k }, chip: true, on: k === order }));
+        sortRel((data.top || []).filter((r) => r.guid), order).slice(0, 15)
+          .forEach((r) => opts.push({ label: relLines(r).join("\n"), value: r }));
+        opts.push({ label: "⬆  Let Whisparr choose (uses your quality profile)", value: "auto", main: true });
+        opts.push({ label: "Cancel", value: null });
+        v = await choose(`Pick a version of "${s.title || "this scene"}"`,
+          "Your file: " + cur.current + ", " + gb(cur.sizeGB) + (cur.mbps ? ", ~" + cur.mbps + " Mbps" : "") +
+          "   (checked " + ago(at) + ")\n⚠ = low bitrate for its resolution: often a heavy re-encode, an upscale or a shorter cut.\n" +
+          "The one you pick downloads now and is merged into this scene when it arrives.", opts);
+        if (v && v.sort) { setOrder(v.sort); continue; }
+        break;
+      }
       if (!v) return;
       if (v === "auto") return requestAuto(w, s, c);
       toast(w.host, "Sending " + v.label + " to the download client…");
@@ -302,7 +330,7 @@
       const back = document.createElement("div");
       back.style.cssText = "position:fixed;inset:0;z-index:100000;background:rgba(0,0,0,.6);display:flex;align-items:center;justify-content:center;";
       const box = document.createElement("div");
-      box.style.cssText = "background:#202b33;color:#eee;border:1px solid #394b59;border-radius:10px;padding:18px;width:min(420px,92vw);font:14px system-ui,sans-serif;box-shadow:0 6px 24px #000a;";
+      box.style.cssText = "background:#202b33;color:#eee;border:1px solid #394b59;border-radius:10px;padding:18px;width:min(420px,92vw);max-height:88vh;overflow:auto;font:14px system-ui,sans-serif;box-shadow:0 6px 24px #000a;";
       const h = document.createElement("div");
       h.textContent = title;
       h.style.cssText = "font-weight:700;font-size:15px;margin-bottom:6px;overflow-wrap:anywhere";
@@ -312,7 +340,24 @@
       box.append(h, p);
       const finish = (v) => { back.remove(); document.removeEventListener("keydown", key, true); resolve(v); };
       const key = (e) => { if (e.key === "Escape") { e.stopPropagation(); finish(null); } };
+      let chips = null;
       for (const o of options) {
+        if (o.chip) {
+          if (!chips) {
+            chips = document.createElement("div");
+            chips.style.cssText = "display:flex;flex-wrap:wrap;gap:4px;align-items:center;margin:2px 0 4px;font-size:12px";
+            chips.append(Object.assign(document.createElement("span"), { textContent: "Sort by:", style: "opacity:.7;margin-right:2px" }));
+            box.appendChild(chips);
+          }
+          const c = document.createElement("button");
+          c.type = "button";
+          c.textContent = o.label;
+          c.style.cssText = "padding:3px 9px;border-radius:12px;cursor:pointer;font:600 12px system-ui,sans-serif;border:1px solid " +
+            (o.on ? "#137cbd;background:#137cbd;color:#fff" : "#394b59;background:transparent;color:#ccc");
+          c.addEventListener("click", (e) => { e.stopPropagation(); if (!o.on) finish(o.value); });
+          chips.appendChild(c);
+          continue;
+        }
         const b = document.createElement("button");
         b.type = "button";
         b.textContent = o.label;
