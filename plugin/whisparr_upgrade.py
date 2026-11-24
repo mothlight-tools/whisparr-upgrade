@@ -156,7 +156,7 @@ def nominal(height, width=0):
 
 def res_label(res, name=None):
     if res >= 2160:
-        return "4K"
+        return f"{round(res * 16 / 9 / 1000)}K"   # 2160 -> 4K, 2880 -> 5K, 3160 -> 6K, 4320 -> 8K
     return f"{res}p" if res else (name or "?")
 
 
@@ -203,11 +203,9 @@ def scene_status(stash, cfg, scene_id):
     out["monitored"] = bool(m.get("monitored"))
     tname, tres = profile_target(cfg, m.get("qualityProfileId"))
     out["target"], out["targetRes"] = res_label(tres, tname), tres
-    mf = m.get("movieFile")
-    if mf and "qualityCutoffNotMet" in mf:
-        out["below"] = bool(mf["qualityCutoffNotMet"])
-    else:
-        out["below"] = bool(tres) and cur < tres
+    # Below target = the file Stash actually has is a lower resolution than the profile's target.
+    # (Whisparr's own "cutoff not met" flag can disagree when its record of the file is out of date.)
+    out["below"] = bool(tres) and bool(cur) and cur < tres
     return out
 
 
