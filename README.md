@@ -88,6 +88,6 @@ Want Whisparr to keep looking after upgraded scenes instead? Turn on **Keep moni
 
 - Deleting is permanent. The file is not moved to a trash folder.
 - Upgrades use your Whisparr quality profile, so Whisparr only grabs something it considers better than what you have.
-- The upgrade check lists releases with a higher resolution than your file (torrents with no seeders are skipped), highest resolution first and, within that, normal-bitrate and larger releases first. When you pick one yourself it is downloaded even if your quality profile would have skipped it; **Let Whisparr choose** follows your profile.
+- The upgrade check lists releases with a higher resolution than your file (torrents with no seeders are skipped), highest resolution first; within that, normal-bitrate releases first, then by your **Whisparr indexer priority** (1 = most preferred, as in Whisparr), then larger and better-seeded releases. When you pick one yourself it is downloaded even if your quality profile would have skipped it; **Let Whisparr choose** follows your profile.
 - Bitrates are worked out from the release size and your current file's length, so a release that is a different cut of the scene shows a misleading bitrate.
 - Messages appear in Stash's log (Settings → Logs), prefixed `[Upgrade]` or `[Delete]`.

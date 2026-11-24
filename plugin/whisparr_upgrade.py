@@ -218,12 +218,23 @@ def search_releases(cfg, movie_id):
     return r.json()
 
 
+def indexer_priorities(cfg):
+    """{indexerId: priority} from Whisparr (1 = most preferred, 25 = default, 50 = least)."""
+    try:
+        r = requests.get(f"{cfg['url']}/api/v3/indexer", headers={"X-Api-Key": cfg["key"]}, timeout=30)
+        r.raise_for_status()
+        return {i.get("id"): i.get("priority", 25) for i in r.json()}
+    except Exception:
+        return {}
+
+
 def check_releases(stash, cfg, scene_id):
     st = scene_status(stash, cfg, scene_id)
     if "movieId" not in st:
         return dict(st, error="This scene isn't linked to Whisparr" if st.get("linked") is False
                     else "This scene isn't in Whisparr")
     dur = st.get("durationSec") or 0
+    prio = indexer_priorities(cfg)
     better = []
     for rel in search_releases(cfg, st["movieId"]):
         q = (rel.get("quality") or {}).get("quality") or {}
@@ -244,14 +255,16 @@ def check_releases(stash, cfg, scene_id):
             "low": bool(mbps is not None and mbps < LOW_MBPS.get(nominal(res), 0)),
             "indexer": rel.get("indexer"),
             "indexerId": rel.get("indexerId"),
+            "priority": prio.get(rel.get("indexerId"), 25),
             "guid": rel.get("guid"),
             "protocol": rel.get("protocol"),
             "seeders": rel.get("seeders"),
             "approved": bool(rel.get("approved")),
             "rejection": ((rel.get("rejections") or [None])[0]),
         })
-    # Highest resolution first; for the same resolution, normal-bitrate before low, then larger, then more seeders.
-    better.sort(key=lambda b: (-b["res"], b["low"], -b["sizeGB"], -(b["seeders"] or 0)))
+    # Highest resolution first; then normal bitrate before low, then your Whisparr indexer priority
+    # (1 = most preferred, like Whisparr itself), then larger, then more seeders.
+    better.sort(key=lambda b: (-b["res"], b["low"], b["priority"], -b["sizeGB"], -(b["seeders"] or 0)))
     top = better[0] if better else None
     return dict(st, better=len(better), bestRes=top["res"] if top else 0, best=top["label"] if top else None,
                 bestSizeGB=top["sizeGB"] if top else None, bestMbps=top["mbps"] if top else None,
