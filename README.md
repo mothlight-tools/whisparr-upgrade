@@ -14,7 +14,9 @@ Optional: a **delete** button that removes the scene and its file *and* adds it 
 |---|---|
 | **⬆ button** (under the scene title + player control bar) | Adds the `Upgrade` tag → Whisparr monitors the scene and searches for a better release. The tag changes to `Upgrade Requested` and the arrow turns green. |
 | **Quality dot** | An orange dot on ⬆ means the file is below your Whisparr quality profile's target. Hover ⬆ for the file's quality and size, e.g. `File: 720p, 1.2 GB · your target: 4K`. |
-| **Check for upgrades** | **Right-click** (or long-press, or Shift+click) ⬆ to search your indexers now. A badge shows the best quality found (e.g. `4K`), and hovering shows the size change, e.g. `720p, 1.2 GB → 4K, 7.5 GB (+6.3 GB)`, plus the top releases. Nothing is downloaded. The result is remembered for 24 hours and shown again when you click ⬆. |
+| **Check for upgrades** | **Right-click** (or long-press, or Shift+click) ⬆ to search your indexers now. A badge shows the best quality found (e.g. `4K`), and hovering shows the size change, e.g. `720p, 1.2 GB → 4K, 7.5 GB (+6.3 GB)`, plus the top releases. Nothing is downloaded until you choose. The result is remembered for 24 hours. |
+| **Pick the release yourself** | After a check (or from ⬆ → **Search now and pick a release myself**), a list shows every better release with its quality, size, **bitrate** and seeders. Click one to download exactly that release, like Whisparr's Interactive Search; it is merged into the scene when it arrives. Or choose **Let Whisparr choose** to use your quality profile as before. |
+| **⚠ low bitrate** | Releases whose bitrate is unusually low for their resolution (under ~12 Mbps for 4K, ~4 Mbps for 1080p) are flagged. These are often heavy re-encodes, upscales or shorter cuts, so a small "4K" file may not look better than your 1080p one. |
 | **Automatic merge** | When the new file is imported, the plugin merges it into the original scene, removes `Upgrade Requested` and stops monitoring the scene in Whisparr (so it isn't upgraded again, or re-downloaded if you delete it later). Run Stash's **Clean** task afterwards to drop the old file entry. |
 | **🗑 button** (off by default) | Opens a choice: **Delete now** (scene + file, and excluded in Whisparr), **Tag it to delete later** (adds `Delete Later`, deletes nothing; the 🗑 turns orange), or Cancel. On a scene already tagged for later, the middle choice is **Keep it**. |
 | **Tags work too** | Adding the `Upgrade` or `Delete` tag by hand (or in bulk) does the same thing. |
@@ -86,5 +88,6 @@ Want Whisparr to keep looking after upgraded scenes instead? Turn on **Keep moni
 
 - Deleting is permanent. The file is not moved to a trash folder.
 - Upgrades use your Whisparr quality profile, so Whisparr only grabs something it considers better than what you have.
-- The upgrade check counts any release with a higher resolution than your file (torrents with no seeders are skipped). Whisparr still applies your quality profile when it actually grabs one.
+- The upgrade check lists releases with a higher resolution than your file (torrents with no seeders are skipped), highest resolution first and, within that, normal-bitrate and larger releases first. When you pick one yourself it is downloaded even if your quality profile would have skipped it; **Let Whisparr choose** follows your profile.
+- Bitrates are worked out from the release size and your current file's length, so a release that is a different cut of the scene shows a misleading bitrate.
 - Messages appear in Stash's log (Settings → Logs), prefixed `[Upgrade]` or `[Delete]`.

@@ -2,8 +2,8 @@
 // Loaded by Stash UI from /plugin/whisparr-upgrade/assets/stashui.js. The server side
 // (Whisparr search, merge, delete + exclusion, quality status and release checks) is the same
 // plugin as in classic Stash.
-//   ⬆  click: ask for an upgrade (confirm shows the last check and the file sizes)
-//      right-click / long-press / Shift+click: search the indexers now
+//   ⬆  click: let Whisparr choose an upgrade, or pick a release yourself from the last check
+//      right-click / long-press / Shift+click: search the indexers now and pick a release
 //      orange dot = file below your Whisparr quality target; blue badge = best quality found
 //   🗑  delete now, tag it to delete later, or keep a scene already tagged for later
 const PLUGIN_ID = "whisparr-upgrade";
@@ -78,12 +78,19 @@ function flash(video, txt, ms) {
 const gb = (x) => (x == null ? "?" : x >= 10 ? Math.round(x) + " GB" : x >= 1 ? x.toFixed(1) + " GB" : Math.round(x * 1000) + " MB");
 // "720p, 1.2 GB → 4K, 7.5 GB (+6.3 GB)"
 function sizeLine(cur, c) {
-  let t = (cur.current || "?") + ", " + gb(cur.sizeGB) + "  →  " + c.best + ", " + gb(c.bestSizeGB);
+  let t = (cur.current || "?") + ", " + gb(cur.sizeGB) + "  →  " + c.best + ", " + gb(c.bestSizeGB) + (c.bestLow ? " ⚠" : "");
   if (cur.sizeGB != null && c.bestSizeGB != null) {
     const d = c.bestSizeGB - cur.sizeGB;
     t += " (" + (d >= 0 ? "+" : "−") + gb(Math.abs(d)) + ")";
   }
   return t;
+}
+// One release as two lines for the picker / tooltip.
+function relLines(r) {
+  const a = [r.label || "?", r.quality, gb(r.sizeGB), r.mbps != null ? "~" + r.mbps + " Mbps" : null].filter(Boolean).join(" · ");
+  const b = [r.indexer, r.seeders != null ? r.seeders + " seeder" + (r.seeders === 1 ? "" : "s") : (r.protocol === "usenet" ? "usenet" : null),
+    r.low ? "⚠ low bitrate" : null, r.approved ? "✓ Whisparr's own pick" : null].filter(Boolean).join(" · ");
+  return [a, b];
 }
 const ago = (t) => {
   const m = Math.round((Date.now() - t) / 60000);
@@ -133,7 +140,7 @@ function choose(title, text, options) {
       const b = document.createElement("button");
       b.type = "button";
       b.textContent = o.label;
-      b.style.cssText = "display:block;width:100%;margin-top:8px;padding:10px 12px;border:0;border-radius:8px;cursor:pointer;text-align:left;" +
+      b.style.cssText = "display:block;width:100%;margin-top:8px;padding:10px 12px;white-space:pre-line;line-height:1.35;border:0;border-radius:8px;cursor:pointer;text-align:left;" +
         "font:600 14px system-ui,sans-serif;color:#fff;background:" +
         (o.danger ? "#c23030" : o.main ? "var(--pink,#ff3e8a)" : "rgba(255,255,255,.1)");
       b.addEventListener("click", (e) => { e.stopPropagation(); finish(o.value); });
@@ -177,7 +184,7 @@ function paintUp(b, s) {
     "pointer-events:none;color:#000;display:none";
   const lines = [req ? "Upgrade already requested" : "Ask Whisparr for a better-quality version"];
   if (st && st.currentRes) {
-    const f = st.current + (st.sizeGB != null ? ", " + gb(st.sizeGB) : "");
+    const f = st.current + (st.sizeGB != null ? ", " + gb(st.sizeGB) : "") + (st.mbps ? ", ~" + st.mbps + " Mbps" : "");
     lines.push(st.targetRes ? "File: " + f + "  ·  your target: " + st.target
       : st.linked === false ? "File: " + f + "  ·  not linked to StashDB, so Whisparr can't look it up"
       : "File: " + f + "  ·  not in Whisparr");
@@ -188,8 +195,7 @@ function paintUp(b, s) {
     else if (d.better) {
       lines.push("Found " + d.better + " better release" + (d.better > 1 ? "s" : "") + " (" + ago(chk.at) + "):");
       lines.push("  " + sizeLine(st && st.sizeGB != null ? st : d, d));
-      (d.top || []).forEach((r) => lines.push("  • " + r.quality + ", " + r.sizeGB + " GB, " + (r.indexer || "") +
-        (r.seeders != null ? ", " + r.seeders + " seeders" : "")));
+      (d.top || []).slice(0, 3).forEach((r) => lines.push("  • " + relLines(r).join(" · ")));
     } else lines.push("No better version found (" + ago(chk.at) + ")");
   }
   if (st && st.movieId) lines.push("Right-click or Shift+click to search the indexers now");
@@ -234,10 +240,44 @@ export default function setup(stashui) {
           flash(ctx.video, data.error ? "Check failed: " + data.error
             : data.better ? "Better version available: " + sizeLine(state.st && state.st.sizeGB != null ? state.st : data, data)
             : "No better version found right now", 4500);
+          if (alive && !data.error && data.better) pick(data, Date.now());
         } catch (e) {
           flash(ctx.video, "Check failed: " + e.message, 4500);
         } finally {
           checking = false;
+        }
+      };
+
+      const requestAuto = async (sc, c) => {
+        await addTag(sc, c.upgrade);
+        state.req = true;
+        if (up) paintUp(up, state);
+        flash(ctx.video, "Upgrade requested – Whisparr will search for a better version");
+      };
+      // Pick one release to download (like Whisparr's Interactive Search), or let Whisparr choose.
+      const pick = async (data, at, scene) => {
+        try {
+          const c = await cfg();
+          const sc = scene || await getScene(ctx.id);
+          if (requested(sc, c)) return flash(ctx.video, "Upgrade already requested");
+          const cur = state.st && state.st.sizeGB != null ? state.st : data;
+          const opts = (data.top || []).filter((r) => r.guid).map((r) => ({ label: relLines(r).join("\n"), value: r }));
+          opts.push({ label: "⬆  Let Whisparr choose (uses your quality profile)", value: "auto", main: true });
+          opts.push({ label: "Cancel", value: null });
+          const v = await choose(`Pick a version of "${sc.title || "this scene"}"`,
+            "Your file: " + cur.current + ", " + gb(cur.sizeGB) + (cur.mbps ? ", ~" + cur.mbps + " Mbps" : "") +
+            "   (checked " + ago(at) + ")\n⚠ = low bitrate for its resolution: often a heavy re-encode, an upscale or a shorter cut.\n" +
+            "The one you pick downloads now and is merged into this scene when it arrives.", opts);
+          if (!v) return;
+          if (v === "auto") return requestAuto(sc, c);
+          flash(ctx.video, "Sending " + v.label + " to the download client…", 10000);
+          const out = await runOp({ mode: "grab", id: state.id, guid: v.guid, indexerId: v.indexerId });
+          if (!out || out.error) return flash(ctx.video, "Couldn't grab it: " + ((out && out.error) || "no answer"), 5000);
+          state.req = true;
+          if (alive && up) paintUp(up, state);
+          flash(ctx.video, "Downloading " + v.label + ", " + gb(v.sizeGB) + " – it will be merged into this scene", 5000);
+        } catch (err) {
+          alert("Upgrade failed: " + err.message);
         }
       };
 
@@ -254,19 +294,15 @@ export default function setup(stashui) {
             const sc = await getScene(ctx.id);
             if (requested(sc, c)) return flash(ctx.video, "Upgrade already requested");
             const chk = savedCheck(state.id, state.st);
-            const found = chk && !chk.data.error
-              ? (chk.data.better
-                ? `\n\nLast check (${ago(chk.at)}) found ${chk.data.better} better release(s):\n${sizeLine(state.st && state.st.sizeGB != null ? state.st : chk.data, chk.data)}`
-                : `\n\nLast check (${ago(chk.at)}) found nothing better - Whisparr will keep looking.`)
-              : "";
-            const ok = await choose(`Upgrade "${sc.title || "this scene"}"?`,
+            if (chk && !chk.data.error && chk.data.better) return pick(chk.data, chk.at, sc);
+            const found = chk && !chk.data.error ? `\n\nLast check (${ago(chk.at)}) found nothing better - Whisparr will keep looking.` : "";
+            const v = await choose(`Upgrade "${sc.title || "this scene"}"?`,
               "Whisparr will look for a better-quality version. When it downloads, it is merged into this scene, keeping markers, rating and history." + found,
-              [{ label: "⬆  Ask Whisparr for a better version", value: true, main: true }, { label: "Cancel", value: null }]);
-            if (!ok) return;
-            await addTag(sc, c.upgrade);
-            state.req = true;
-            paintUp(b, state);
-            flash(ctx.video, "Upgrade requested – Whisparr will search for a better version");
+              [{ label: "⬆  Let Whisparr choose (uses your quality profile)", value: "auto", main: true },
+               { label: "🔍  Search now and pick a release myself", value: "search" },
+               { label: "Cancel", value: null }]);
+            if (v === "search") return checkNow();
+            if (v === "auto") await requestAuto(sc, c);
           } catch (err) {
             alert("Upgrade request failed: " + err.message);
           }

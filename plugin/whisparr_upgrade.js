@@ -135,12 +135,20 @@
   // "720p, 1.2 GB → 4K, 7.5 GB (+6.3 GB)"
   function sizeLine(cur, c) {
     if (!c || !c.better) return "";
-    let t = (cur.current || "?") + ", " + gb(cur.sizeGB) + "  →  " + c.best + ", " + gb(c.bestSizeGB);
+    let t = (cur.current || "?") + ", " + gb(cur.sizeGB) + "  →  " + c.best + ", " + gb(c.bestSizeGB) + (c.bestLow ? " ⚠" : "");
     if (cur.sizeGB != null && c.bestSizeGB != null) {
       const d = c.bestSizeGB - cur.sizeGB;
       t += " (" + (d >= 0 ? "+" : "−") + gb(Math.abs(d)) + ")";
     }
     return t;
+  }
+
+  // One release as two lines for the picker / tooltip.
+  function relLines(r) {
+    const a = [r.label || "?", r.quality, gb(r.sizeGB), r.mbps != null ? "~" + r.mbps + " Mbps" : null].filter(Boolean).join(" · ");
+    const b = [r.indexer, r.seeders != null ? r.seeders + " seeder" + (r.seeders === 1 ? "" : "s") : (r.protocol === "usenet" ? "usenet" : null),
+      r.low ? "⚠ low bitrate" : null, r.approved ? "✓ Whisparr's own pick" : null].filter(Boolean).join(" · ");
+    return [a, b];
   }
   function ago(t) {
     const m = Math.round((Date.now() - t) / 60000);
@@ -162,7 +170,7 @@
     if (b._req) lines.push("Upgrade already requested");
     else lines.push("Ask Whisparr for a better-quality version");
     if (st && st.currentRes) {
-      const f = st.current + (st.sizeGB != null ? ", " + gb(st.sizeGB) : "");
+      const f = st.current + (st.sizeGB != null ? ", " + gb(st.sizeGB) : "") + (st.mbps ? ", ~" + st.mbps + " Mbps" : "");
       if (st.targetRes) lines.push("File: " + f + "  ·  your target: " + st.target);
       else if (st.linked === false) lines.push("File: " + f + "  ·  not linked to StashDB, so Whisparr can't look it up");
       else if (st.inWhisparr === false) lines.push("File: " + f + "  ·  not in Whisparr");
@@ -173,8 +181,8 @@
       else if (c.better) {
         lines.push("Found " + c.better + " better release" + (c.better > 1 ? "s" : "") + " (" + ago(chk.at) + "):");
         lines.push("  " + sizeLine(st && st.sizeGB != null ? st : c, c));
-        (c.top || []).forEach((r) => lines.push("  • " + r.quality + ", " + r.sizeGB + " GB, " + (r.indexer || "") +
-          (r.seeders != null ? ", " + r.seeders + " seeders" : "")));
+        (c.top || []).forEach((r) => lines.push("  • " + relLines(r).join(" · ") +
+          ""));
       } else lines.push("No better version found (" + ago(chk.at) + ")");
     }
     if (!b._req) {
@@ -207,6 +215,7 @@
         data.error ? "Check failed: " + data.error :
         data.better ? "Better version available: " + sizeLine(data, data) :
         "No better version found right now");
+      if (!data.error && data.better) pick(btn, w, data, Date.now());
     } catch (e) {
       toast(document.contains(w.host) ? w.host : document.body, "Check failed: " + e.message);
     } finally {
@@ -225,17 +234,50 @@
         return;
       }
       const chk = savedCheck(w.id, btn._st);
-      const found = chk && !chk.data.error
-        ? (chk.data.better ? `\n\nLast check (${ago(chk.at)}) found ${chk.data.better} better release(s):\n${sizeLine(btn._st && btn._st.sizeGB != null ? btn._st : chk.data, chk.data)}`
-                           : `\n\nLast check (${ago(chk.at)}) found nothing better - Whisparr will keep looking.`)
-        : "";
-      if (!confirm(`Ask Whisparr to find a better-quality version of "${s.title || "this scene"}"?\n\nWhen it downloads, it is merged into this scene, keeping markers, rating and history.` + found)) return;
-      await addTag(w.id, s, c.upgrade);
-      // every ⬆ for this scene (scene page and any screens showing it) turns green
-      document.querySelectorAll('.wu-up[data-sid="' + w.id + '"]').forEach((b) => { b._req = true; paint(b); });
-      toast(w.host, "Upgrade requested - Whisparr will search for a better version");
+      if (chk && !chk.data.error && chk.data.better) return pick(btn, w, chk.data, chk.at, s);
+      const found = chk && !chk.data.error ? `\n\nLast check (${ago(chk.at)}) found nothing better - Whisparr will keep looking.` : "";
+      const v = await choose(`Upgrade "${s.title || "this scene"}"?`,
+        "Whisparr will look for a better-quality version. When it downloads, it is merged into this scene, keeping markers, rating and history." + found,
+        [{ label: "⬆  Let Whisparr choose (uses your quality profile)", value: "auto", main: true },
+         { label: "🔍  Search now and pick a release myself", value: "search" },
+         { label: "Cancel", value: null }]);
+      if (v === "search") return checkNow(btn);
+      if (v === "auto") await requestAuto(w, s, c);
     } catch (e) {
       alert("Upgrade request failed: " + e.message);
+    }
+  }
+
+  async function requestAuto(w, s, c) {
+    await addTag(w.id, s, c.upgrade);
+    // every ⬆ for this scene (scene page and any screens showing it) turns green
+    document.querySelectorAll('.wu-up[data-sid="' + w.id + '"]').forEach((b) => { b._req = true; paint(b); });
+    toast(w.host, "Upgrade requested - Whisparr will search for a better version");
+  }
+
+  // Pick one release to download (like Whisparr's Interactive Search), or let Whisparr choose.
+  async function pick(btn, w, data, at, scene) {
+    try {
+      const c = await cfg();
+      const s = scene || await getScene(w.id);
+      if (isRequested(s, c)) return toast(w.host, "Upgrade already requested for this scene");
+      const cur = (btn._st && btn._st.sizeGB != null) ? btn._st : data;
+      const opts = (data.top || []).filter((r) => r.guid).map((r) => ({ label: relLines(r).join("\n"), value: r }));
+      opts.push({ label: "⬆  Let Whisparr choose (uses your quality profile)", value: "auto", main: true });
+      opts.push({ label: "Cancel", value: null });
+      const v = await choose(`Pick a version of "${s.title || "this scene"}"`,
+        "Your file: " + cur.current + ", " + gb(cur.sizeGB) + (cur.mbps ? ", ~" + cur.mbps + " Mbps" : "") +
+        "   (checked " + ago(at) + ")\n⚠ = low bitrate for its resolution: often a heavy re-encode, an upscale or a shorter cut.\n" +
+        "The one you pick downloads now and is merged into this scene when it arrives.", opts);
+      if (!v) return;
+      if (v === "auto") return requestAuto(w, s, c);
+      toast(w.host, "Sending " + v.label + " to the download client…");
+      const out = await runOp({ mode: "grab", id: w.id, guid: v.guid, indexerId: v.indexerId });
+      if (!out || out.error) return toast(document.contains(w.host) ? w.host : document.body, "Couldn't grab it: " + ((out && out.error) || "no answer"));
+      document.querySelectorAll('.wu-up[data-sid="' + w.id + '"]').forEach((b) => { b._req = true; paint(b); });
+      toast(document.contains(w.host) ? w.host : document.body, "Downloading " + v.label + ", " + gb(v.sizeGB) + " - it will be merged into this scene");
+    } catch (e) {
+      alert("Upgrade failed: " + e.message);
     }
   }
 
@@ -274,7 +316,7 @@
         const b = document.createElement("button");
         b.type = "button";
         b.textContent = o.label;
-        b.style.cssText = "display:block;width:100%;margin-top:8px;padding:10px 12px;border:0;border-radius:6px;cursor:pointer;text-align:left;font:600 14px system-ui,sans-serif;color:#fff;background:" +
+        b.style.cssText = "display:block;width:100%;margin-top:8px;padding:10px 12px;white-space:pre-line;line-height:1.35;border:0;border-radius:6px;cursor:pointer;text-align:left;font:600 14px system-ui,sans-serif;color:#fff;background:" +
           (o.danger ? "#c23030" : o.main ? "#137cbd" : "#394b59");
         b.addEventListener("click", (e) => { e.stopPropagation(); finish(o.value); });
         box.appendChild(b);

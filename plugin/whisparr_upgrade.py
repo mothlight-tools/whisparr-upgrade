@@ -12,8 +12,10 @@ Scene.Create.Post
 
 Run from the browser (runPluginOperation, no hook):
   * mode "status", ids [...] -> each scene's file quality vs the quality profile's target in Whisparr.
-  * mode "check", id        -> ask Whisparr to search the indexers now and report better releases.
-    Nothing is downloaded by either.
+  * mode "check", id        -> ask Whisparr to search the indexers now and report better releases
+                               (with size, bitrate and a low-bitrate warning). Nothing is downloaded.
+  * mode "grab", id, guid, indexerId -> download that one release (as Whisparr's Interactive Search
+                               does), and mark the scene Upgrade Requested so it is merged on import.
 
 Requires: stashapp-tools (pip install stashapp-tools), which also installs requests.
 """
@@ -137,7 +139,9 @@ def merge_upgraded(stash, cfg, new_scene):
 
 
 NOMINAL = [2160, 1440, 1080, 720, 576, 480, 360, 240]
-FRAG_FILES = FRAG.replace("files { path }", "files { path height width size }")
+FRAG_FILES = FRAG.replace("files { path }", "files { path height width size duration }")
+# Below these Mbps a release is flagged "low bitrate" (likely a heavy re-encode, upscale or short cut).
+LOW_MBPS = {2160: 12, 1440: 7, 1080: 4, 720: 2, 576: 1.2, 480: 1}
 _profiles = {}
 
 
@@ -183,7 +187,9 @@ def scene_status(stash, cfg, scene_id):
     files = scene.get("files") or []
     cur = max([nominal(f.get("height"), f.get("width")) for f in files] or [0])
     size = max([f.get("size") or 0 for f in files] or [0])
-    out = {"currentRes": cur, "current": res_label(cur), "sizeGB": round(size / 1e9, 2)}
+    dur = max([f.get("duration") or 0 for f in files] or [0])
+    out = {"currentRes": cur, "current": res_label(cur), "sizeGB": round(size / 1e9, 2),
+           "durationSec": round(dur), "mbps": round(size * 8 / dur / 1e6, 1) if dur else None}
     sid = stashdb_id(scene)
     if not sid:
         out["linked"] = False
@@ -205,35 +211,85 @@ def scene_status(stash, cfg, scene_id):
     return out
 
 
+def search_releases(cfg, movie_id):
+    r = requests.get(f"{cfg['url']}/api/v3/release", params={"movieId": movie_id},
+                     headers={"X-Api-Key": cfg["key"]}, timeout=240)
+    r.raise_for_status()
+    return r.json()
+
+
 def check_releases(stash, cfg, scene_id):
     st = scene_status(stash, cfg, scene_id)
     if "movieId" not in st:
         return dict(st, error="This scene isn't linked to Whisparr" if st.get("linked") is False
                     else "This scene isn't in Whisparr")
-    r = requests.get(f"{cfg['url']}/api/v3/release", params={"movieId": st["movieId"]},
-                     headers={"X-Api-Key": cfg["key"]}, timeout=240)
-    r.raise_for_status()
+    dur = st.get("durationSec") or 0
     better = []
-    for rel in r.json():
+    for rel in search_releases(cfg, st["movieId"]):
         q = (rel.get("quality") or {}).get("quality") or {}
         res = q.get("resolution") or 0
         if res <= st["currentRes"]:
             continue
         if rel.get("protocol") == "torrent" and (rel.get("seeders") or 0) < 1:
             continue
+        size = rel.get("size") or 0
+        mbps = round(size * 8 / dur / 1e6, 1) if dur and size else None
         better.append({
             "title": rel.get("title"),
             "quality": q.get("name"),
             "res": res,
-            "sizeGB": round((rel.get("size") or 0) / 1e9, 1),
+            "label": res_label(res),
+            "sizeGB": round(size / 1e9, 1),
+            "mbps": mbps,
+            "low": bool(mbps is not None and mbps < LOW_MBPS.get(nominal(res), 0)),
             "indexer": rel.get("indexer"),
+            "indexerId": rel.get("indexerId"),
+            "guid": rel.get("guid"),
+            "protocol": rel.get("protocol"),
             "seeders": rel.get("seeders"),
             "approved": bool(rel.get("approved")),
+            "rejection": ((rel.get("rejections") or [None])[0]),
         })
-    better.sort(key=lambda b: (-b["res"], not b["approved"], -(b["seeders"] or 0)))
-    best = better[0]["res"] if better else 0
-    return dict(st, better=len(better), bestRes=best, best=res_label(best) if best else None,
-                bestSizeGB=better[0]["sizeGB"] if better else None, top=better[:3])
+    # Highest resolution first; for the same resolution, normal-bitrate before low, then larger, then more seeders.
+    better.sort(key=lambda b: (-b["res"], b["low"], -b["sizeGB"], -(b["seeders"] or 0)))
+    top = better[0] if better else None
+    return dict(st, better=len(better), bestRes=top["res"] if top else 0, best=top["label"] if top else None,
+                bestSizeGB=top["sizeGB"] if top else None, bestMbps=top["mbps"] if top else None,
+                bestLow=top["low"] if top else False, top=better[:12])
+
+
+def grab_release(stash, cfg, scene_id, guid, indexer_id):
+    """Download one specific release, like Whisparr's Interactive Search, then mark the scene pending."""
+    scene = stash.find_scene(scene_id, fragment=FRAG)
+    if not scene:
+        return {"error": "scene not found"}
+    st = scene_status(stash, cfg, scene_id)
+    if "movieId" not in st:
+        return {"error": "This scene isn't in Whisparr"}
+    h = {"X-Api-Key": cfg["key"]}
+    body = {"guid": guid, "indexerId": indexer_id}
+
+    def push():
+        return requests.post(f"{cfg['url']}/api/v3/release", json=body, headers=h, timeout=120)
+
+    r = push()
+    if r.status_code >= 400:
+        # Whisparr only keeps search results for a while - search again, then grab the same release.
+        found = [x for x in search_releases(cfg, st["movieId"]) if x.get("guid") == guid]
+        if not found:
+            return {"error": "That release is no longer available - run the check again"}
+        body["indexerId"] = found[0].get("indexerId", indexer_id)
+        r = push()
+    if r.status_code >= 400:
+        try:
+            msg = r.json()
+            msg = msg.get("message") or msg[0].get("errorMessage") if isinstance(msg, (dict, list)) else r.text
+        except Exception:
+            msg = r.text
+        return {"error": f"Whisparr refused it: {str(msg)[:200]}"}
+    set_tags(stash, scene, {cfg["upgrade"].lower()}, tag_id(stash, cfg["pending"]))
+    log.info(f"[Upgrade] Sent the chosen release for '{scene['title']}' to the download client")
+    return {"ok": True}
 
 
 def main():
@@ -253,7 +309,7 @@ def main():
     }
     if not hook.get("id"):
         mode = args.get("mode")
-        if mode in ("status", "check"):
+        if mode in ("status", "check", "grab"):
             if not cfg["key"]:
                 done({"error": "Whisparr API key not set in the plugin settings"})
             try:
@@ -265,6 +321,8 @@ def main():
                         except Exception as e:
                             out[str(i)] = {"error": str(e)}
                     done(out)
+                if mode == "grab":
+                    done(grab_release(stash, cfg, args.get("id"), args.get("guid"), args.get("indexerId")))
                 done(check_releases(stash, cfg, args.get("id")))
             except Exception as e:
                 done({"error": str(e)})
