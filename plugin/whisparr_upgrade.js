@@ -1,6 +1,8 @@
-/* Whisparr Upgrade - scene page + player buttons.
+/* Whisparr Upgrade - scene page + player buttons (also on every DirtyMultiscreen screen).
    ⬆  adds the Upgrade tag (the plugin then asks Whisparr for a better version).
-   🗑  adds the Delete tag (only shown when "Enable delete" is on in the plugin settings). */
+   🗑  adds the Delete tag (only shown when "Enable delete" is on in the plugin settings).
+   A dot on ⬆ means the file is below your Whisparr quality target; right-click, long-press or Shift+click
+   ⬆ to search the indexers now - a badge then shows the best quality found (e.g. "4K"). */
 (function () {
   "use strict";
   const PLUGIN_ID = "whisparr-upgrade";
@@ -25,6 +27,7 @@
       upgrade: raw.UPGRADE_TAG || "Upgrade",
       pending: raw.PENDING_TAG || "Upgrade Requested",
       del: raw.DELETE_TAG || "Delete",
+      later: raw.DELETE_LATER_TAG || "Delete Later",
       enableDelete: !!raw.ENABLE_DELETE,
       hide: !!raw.HIDE_BUTTONS,
     };
@@ -32,17 +35,30 @@
     return cfgCache;
   }
 
-  const sceneId = () => (location.pathname.match(/^\/scenes\/(\d+)/) || [])[1];
+  const pageSceneId = () => (location.pathname.match(/^\/scenes\/(\d+)/) || [])[1];
 
-  function toast(txt) {
-    const host = document.querySelector(".scene-player-container .video-js") || document.body;
+  /* ---------- which player / scene a button belongs to ---------- */
+  function cellScene(cell) {
+    const a = cell.querySelector("a.ms-scene-link");
+    return a ? ((a.getAttribute("href") || "").match(/\/scenes\/(\d+)/) || [])[1] : undefined;
+  }
+  // { id, cell, host } for the scene a button controls, read when it is clicked.
+  function where(el) {
+    const cell = el && el.closest && el.closest("[data-ms-screen]");
+    if (cell) return { id: cellScene(cell), cell, host: cell.querySelector(".video-js") || cell };
+    return { id: pageSceneId(), cell: null, host: document.querySelector(".scene-player-container .video-js") || document.body };
+  }
+
+  function toast(host, txt) {
+    host = host || document.body;
     let t = host.querySelector(".wu-toast");
     if (!t) {
       t = document.createElement("div");
       t.className = "wu-toast";
       t.style.cssText =
         "position:absolute;top:12px;left:50%;transform:translateX(-50%);background:rgba(0,0,0,.8);" +
-        "color:#fff;padding:5px 14px;border-radius:4px;font-size:15px;z-index:9999;pointer-events:none;transition:opacity .3s";
+        "color:#fff;padding:5px 14px;border-radius:4px;font-size:15px;z-index:9999;pointer-events:none;transition:opacity .3s;" +
+        "max-width:90%;white-space:nowrap;overflow:hidden;text-overflow:ellipsis";
       host.appendChild(t);
     }
     t.textContent = txt;
@@ -75,35 +91,258 @@
     return n.includes(c.upgrade.toLowerCase()) || n.includes(c.pending.toLowerCase());
   }
 
-  async function upgrade(btns) {
-    const id = sceneId();
-    if (!id) return;
+  /* ---------- upgrade availability ---------- */
+  async function runOp(args) {
+    const d = await gql("mutation($p:ID!,$a:Map!){runPluginOperation(plugin_id:$p,args:$a)}", { p: PLUGIN_ID, a: args });
+    return d.runPluginOperation;
+  }
+  // File quality vs target, asked in batches (every screen of a multiscreen at once). Cached 10 min.
+  const statusCache = new Map(), waiting = new Map();
+  let batchTimer = null;
+  function status(sid) {
+    const c = statusCache.get(sid);
+    if (c && Date.now() - c.at < 600000) return Promise.resolve(c.data);
+    if (!waiting.has(sid)) {
+      let res;
+      const pr = new Promise((r) => (res = r));
+      waiting.set(sid, { pr, res });
+      clearTimeout(batchTimer);
+      batchTimer = setTimeout(async () => {
+        const batch = new Map(waiting);
+        waiting.clear();
+        let out = {};
+        try { out = (await runOp({ mode: "status", ids: [...batch.keys()] })) || {}; } catch (e) {}
+        for (const [id, w] of batch) {
+          const data = out[id] || null;
+          if (data && !data.error) statusCache.set(id, { at: Date.now(), data });
+          w.res(data);
+        }
+      }, 300);
+    }
+    return waiting.get(sid).pr;
+  }
+  // Last indexer search per scene, kept 24 h in this browser.
+  const CK = "wu-check:";
+  function savedCheck(sid, st) {
+    try {
+      const c = JSON.parse(localStorage.getItem(CK + sid) || "null");
+      if (!c || Date.now() - c.at > 86400000) return null;
+      if (st && st.currentRes && c.data.currentRes !== st.currentRes) return null; // the file changed since
+      return c;
+    } catch (e) { return null; }
+  }
+  const gb = (x) => (x == null ? "?" : x >= 10 ? Math.round(x) + " GB" : x >= 1 ? x.toFixed(1) + " GB" : Math.round(x * 1000) + " MB");
+  // "720p, 1.2 GB → 4K, 7.5 GB (+6.3 GB)"
+  function sizeLine(cur, c) {
+    if (!c || !c.better) return "";
+    let t = (cur.current || "?") + ", " + gb(cur.sizeGB) + "  →  " + c.best + ", " + gb(c.bestSizeGB);
+    if (cur.sizeGB != null && c.bestSizeGB != null) {
+      const d = c.bestSizeGB - cur.sizeGB;
+      t += " (" + (d >= 0 ? "+" : "−") + gb(Math.abs(d)) + ")";
+    }
+    return t;
+  }
+  function ago(t) {
+    const m = Math.round((Date.now() - t) / 60000);
+    return m < 1 ? "just now" : m < 60 ? m + " min ago" : Math.round(m / 60) + " h ago";
+  }
+  function paint(b) {
+    const st = b._st, chk = savedCheck(b.dataset.sid, st);
+    let badge = b.querySelector(".wu-badge");
+    if (!badge) {
+      badge = document.createElement("span");
+      badge.className = "wu-badge";
+      badge.style.cssText = "position:absolute;top:2px;right:0;font:700 9px/1 system-ui,sans-serif;padding:1px 3px;" +
+        "border-radius:6px;pointer-events:none;display:none";
+      b.appendChild(badge);
+    }
+    badge.style.display = "none";
+    const lines = [];
+    b.style.color = b._req ? "#4caf50" : "";
+    if (b._req) lines.push("Upgrade already requested");
+    else lines.push("Ask Whisparr for a better-quality version");
+    if (st && st.currentRes) {
+      const f = st.current + (st.sizeGB != null ? ", " + gb(st.sizeGB) : "");
+      if (st.targetRes) lines.push("File: " + f + "  ·  your target: " + st.target);
+      else if (st.linked === false) lines.push("File: " + f + "  ·  not linked to StashDB, so Whisparr can't look it up");
+      else if (st.inWhisparr === false) lines.push("File: " + f + "  ·  not in Whisparr");
+    }
+    if (chk) {
+      const c = chk.data;
+      if (c.error) lines.push("Last check failed: " + c.error);
+      else if (c.better) {
+        lines.push("Found " + c.better + " better release" + (c.better > 1 ? "s" : "") + " (" + ago(chk.at) + "):");
+        lines.push("  " + sizeLine(st && st.sizeGB != null ? st : c, c));
+        (c.top || []).forEach((r) => lines.push("  • " + r.quality + ", " + r.sizeGB + " GB, " + (r.indexer || "") +
+          (r.seeders != null ? ", " + r.seeders + " seeders" : "")));
+      } else lines.push("No better version found (" + ago(chk.at) + ")");
+    }
+    if (!b._req) {
+      if (chk && !chk.data.error && chk.data.better) {
+        badge.textContent = chk.data.best;
+        badge.style.cssText += ";display:block;background:#00bcd4;color:#000";
+      } else if (st && st.below && !(chk && !chk.data.error && !chk.data.better)) {
+        badge.textContent = "";
+        badge.style.cssText += ";display:block;width:7px;height:7px;padding:0;border-radius:50%;background:#f5a623";
+      }
+    }
+    if (st && st.movieId) lines.push("Right-click or Shift+click to search the indexers for a better version now");
+    b.title = lines.join("\n");
+  }
+  function repaint(sid) {
+    document.querySelectorAll('.wu-up[data-sid="' + sid + '"]').forEach(paint);
+  }
+  const checking = new Set();
+  async function checkNow(btn) {
+    const w = where(btn);
+    if (!w.id || checking.has(w.id)) return;
+    checking.add(w.id);
+    toast(w.host, "Searching your indexers for a better version…");
+    try {
+      const data = await runOp({ mode: "check", id: w.id });
+      if (!data) throw new Error("no answer from the plugin");
+      try { localStorage.setItem(CK + w.id, JSON.stringify({ at: Date.now(), data })); } catch (e) {}
+      repaint(w.id);
+      toast(document.contains(w.host) ? w.host : document.body,
+        data.error ? "Check failed: " + data.error :
+        data.better ? "Better version available: " + sizeLine(data, data) :
+        "No better version found right now");
+    } catch (e) {
+      toast(document.contains(w.host) ? w.host : document.body, "Check failed: " + e.message);
+    } finally {
+      checking.delete(w.id);
+    }
+  }
+
+  async function upgrade(btn) {
+    const w = where(btn);
+    if (!w.id) return;
     try {
       const c = await cfg();
-      const s = await getScene(id);
+      const s = await getScene(w.id);
       if (isRequested(s, c)) {
-        toast("Upgrade already requested for this scene");
+        toast(w.host, "Upgrade already requested for this scene");
         return;
       }
-      if (!confirm(`Ask Whisparr to find a better-quality version of "${s.title || "this scene"}"?\n\nWhen it downloads, it is merged into this scene, keeping markers, rating and history.`)) return;
-      await addTag(id, s, c.upgrade);
-      btns.forEach((b) => look(b, true));
-      toast("Upgrade requested - Whisparr will search for a better version");
+      const chk = savedCheck(w.id, btn._st);
+      const found = chk && !chk.data.error
+        ? (chk.data.better ? `\n\nLast check (${ago(chk.at)}) found ${chk.data.better} better release(s):\n${sizeLine(btn._st && btn._st.sizeGB != null ? btn._st : chk.data, chk.data)}`
+                           : `\n\nLast check (${ago(chk.at)}) found nothing better - Whisparr will keep looking.`)
+        : "";
+      if (!confirm(`Ask Whisparr to find a better-quality version of "${s.title || "this scene"}"?\n\nWhen it downloads, it is merged into this scene, keeping markers, rating and history.` + found)) return;
+      await addTag(w.id, s, c.upgrade);
+      // every ⬆ for this scene (scene page and any screens showing it) turns green
+      document.querySelectorAll('.wu-up[data-sid="' + w.id + '"]').forEach((b) => { b._req = true; paint(b); });
+      toast(w.host, "Upgrade requested - Whisparr will search for a better version");
     } catch (e) {
       alert("Upgrade request failed: " + e.message);
     }
   }
 
-  async function del() {
-    const id = sceneId();
-    if (!id) return;
+  // On a multiscreen screen: press that screen's own "next" button.
+  function nextOnScreen(cell) {
+    const bar = cell.querySelector(".vjs-control-bar");
+    if (!bar) return false;
+    const btn = [...bar.querySelectorAll("button")].find((b) => {
+      const s = (b.className + " " + (b.title || "") + " " + (b.getAttribute("aria-label") || "") + " " +
+        ((b.querySelector(".vjs-control-text") || {}).textContent || "")).toLowerCase();
+      return /next|skip.?forward/.test(s) && !/marker|xp-/.test(s);
+    });
+    if (btn) { btn.click(); return true; }
+    return false;
+  }
+
+  // A small dialog with several choices (confirm() only has OK/Cancel).
+  // Shown inside the fullscreen player when there is one, so it is never hidden behind it.
+  function choose(title, text, options) {
+    return new Promise((resolve) => {
+      const host = document.fullscreenElement || document.body;
+      const back = document.createElement("div");
+      back.style.cssText = "position:fixed;inset:0;z-index:100000;background:rgba(0,0,0,.6);display:flex;align-items:center;justify-content:center;";
+      const box = document.createElement("div");
+      box.style.cssText = "background:#202b33;color:#eee;border:1px solid #394b59;border-radius:10px;padding:18px;width:min(420px,92vw);font:14px system-ui,sans-serif;box-shadow:0 6px 24px #000a;";
+      const h = document.createElement("div");
+      h.textContent = title;
+      h.style.cssText = "font-weight:700;font-size:15px;margin-bottom:6px;overflow-wrap:anywhere";
+      const p = document.createElement("div");
+      p.textContent = text;
+      p.style.cssText = "opacity:.8;margin-bottom:12px;white-space:pre-line";
+      box.append(h, p);
+      const finish = (v) => { back.remove(); document.removeEventListener("keydown", key, true); resolve(v); };
+      const key = (e) => { if (e.key === "Escape") { e.stopPropagation(); finish(null); } };
+      for (const o of options) {
+        const b = document.createElement("button");
+        b.type = "button";
+        b.textContent = o.label;
+        b.style.cssText = "display:block;width:100%;margin-top:8px;padding:10px 12px;border:0;border-radius:6px;cursor:pointer;text-align:left;font:600 14px system-ui,sans-serif;color:#fff;background:" +
+          (o.danger ? "#c23030" : o.main ? "#137cbd" : "#394b59");
+        b.addEventListener("click", (e) => { e.stopPropagation(); finish(o.value); });
+        box.appendChild(b);
+      }
+      back.addEventListener("click", (e) => { e.stopPropagation(); if (e.target === back) finish(null); });
+      back.addEventListener("pointerdown", (e) => e.stopPropagation());
+      document.addEventListener("keydown", key, true);
+      back.appendChild(box);
+      host.appendChild(back);
+    });
+  }
+
+  const hasTag = (scene, name) => scene.tags.some((t) => t.name.toLowerCase() === name.toLowerCase());
+
+  async function removeTag(id, scene, name) {
+    const ids = scene.tags.filter((t) => t.name.toLowerCase() !== name.toLowerCase()).map((t) => t.id);
+    await gql("mutation($id:ID!,$t:[ID!]){sceneUpdate(input:{id:$id,tag_ids:$t}){id}}", { id, t: ids });
+  }
+
+  function paintDel(b, later) {
+    b._later = later;
+    b.style.color = later ? "#f5a623" : "";
+    b.title = later ? "Tagged to delete later - click to delete now or remove the tag"
+                    : "Delete scene + file (and exclude in Whisparr), or tag it to delete later";
+  }
+
+  async function del(btn) {
+    const w = where(btn);
+    if (!w.id) return;
     try {
       const c = await cfg();
       if (!c.enableDelete) return;
-      const s = await getScene(id);
-      if (!confirm(`Delete "${s.title || "this scene"}" and its file?\n\nIt will also be excluded in Whisparr so it is never downloaded again.`)) return;
+      const s = await getScene(w.id);
+      const later = hasTag(s, c.later);
+      const name = s.title || "this scene";
+      const opts = [
+        { label: "🗑  Delete now - scene, file and Whisparr exclusion", value: "now", danger: true },
+        later ? { label: "↩  Keep it - remove the \"" + c.later + "\" tag", value: "untag" }
+              : { label: "🏷  Tag it to delete later (\"" + c.later + "\")", value: "later", main: true },
+        { label: "Cancel", value: null },
+      ];
+      const pick = await choose(
+        "Delete \"" + name + "\"?",
+        (later ? "This scene is already tagged to delete later.\n\n" : "") +
+        "Deleting now removes the scene and its file, and excludes it in Whisparr so it is never downloaded again." +
+        (later ? "" : "\nTagging only marks it - nothing is deleted, and you can find it later by filtering on the tag."),
+        opts);
+      if (!pick) return;
+      if (pick === "later" || pick === "untag") {
+        if (pick === "later") await addTag(w.id, s, c.later);
+        else await removeTag(w.id, s, c.later);
+        document.querySelectorAll('.wu-del[data-sid="' + w.id + '"]').forEach((b) => paintDel(b, pick === "later"));
+        toast(w.host, pick === "later" ? "Tagged \"" + c.later + "\" - nothing deleted" : "Removed the \"" + c.later + "\" tag");
+        return;
+      }
+      if (w.cell) {
+        // Multiscreen: keep the grid open, move this screen on, then delete.
+        const host = w.host;
+        if (!nextOnScreen(w.cell)) {
+          const v = w.cell.querySelector("video");
+          if (v) v.pause();
+        }
+        await addTag(w.id, s, c.del);
+        toast(document.contains(host) ? host : w.cell, "Deleted \"" + (s.title || "scene") + "\"");
+        return;
+      }
       if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
-      await addTag(id, s, c.del);
+      await addTag(w.id, s, c.del);
       if (history.length > 1) history.back();
       else location.assign("/scenes");
     } catch (e) {
@@ -111,47 +350,67 @@
     }
   }
 
-  function look(b, requested) {
-    b.style.color = requested ? "#4caf50" : "";
-    b.title = requested ? "Upgrade already requested" : "Ask Whisparr for a better-quality version";
-  }
-
-  function mk(cls, txt, onClick, player) {
+  function mk(cls, txt, onClick, player, sid) {
     const b = document.createElement("button");
     b.type = "button";
     b.className = (player ? "vjs-control vjs-button " : "minimal btn btn-secondary ") + cls;
-    b.textContent = txt;
-    b.style.cssText = player ? "font-size:1.6em;cursor:pointer;width:2em;font-weight:bold;" : "font-size:1em;padding:0 .45em;line-height:1.6;";
+    b.dataset.sid = sid;
+    if (player) {
+      // size the symbol, not the button, so it keeps the player's row height
+      b.style.cssText = "cursor:pointer;width:2.4em;display:flex;align-items:center;justify-content:center;position:relative;";
+      const g = document.createElement("span");
+      g.textContent = txt;
+      g.style.cssText = "font-size:1.6em;line-height:1;font-weight:bold;";
+      b.appendChild(g);
+    } else {
+      b.textContent = txt;
+      b.style.cssText = "font-size:1em;padding:0 .45em;line-height:1.6;position:relative;";
+    }
     b.addEventListener("click", (e) => {
       e.stopPropagation();
-      onClick();
+      onClick(b);
     });
     return b;
   }
 
+  // Every place buttons should be: [host element, is it a player bar, scene id]
+  function targets() {
+    const out = [];
+    const id = pageSceneId();
+    if (id) {
+      const bar = document.querySelector(".scene-player-container .vjs-control-bar");
+      // Scene-page buttons go in the line under the title, between the date and
+      // the quality (e.g. "29.97 fps | 1080p"); fall back to the toolbar.
+      const tb = document.querySelector(".scene-subheader") || document.querySelector(".scene-toolbar");
+      if (bar) out.push([bar, true, id]);
+      if (tb) out.push([tb, false, id]);
+    }
+    for (const cell of document.querySelectorAll(".ms-route [data-ms-screen]")) {
+      const sid = cellScene(cell);
+      const bar = cell.querySelector(".ms-native-tile .vjs-control-bar");
+      if (sid && bar) out.push([bar, true, sid]);
+    }
+    return out;
+  }
+
   let busy = false;
   async function inject() {
-    const id = sceneId();
-    if (!id || busy) return;
-    const bar = document.querySelector(".scene-player-container .vjs-control-bar");
-    // Scene-page buttons go in the line under the title, between the date and
-    // the quality (e.g. "29.97 fps | 1080p"); fall back to the toolbar.
-    const tb = document.querySelector(".scene-subheader") || document.querySelector(".scene-toolbar");
-    const need =
-      (bar && (!bar.querySelector(".wu-up") || bar.dataset.wuSid !== id)) ||
-      (tb && (!tb.querySelector(".wu-up") || tb.dataset.wuSid !== id));
-    if (!need) return;
+    if (busy) return;
+    const todo = targets().filter(([host, , sid]) => !host.querySelector(".wu-up") || host.dataset.wuSid !== sid);
+    if (!todo.length) return;
     busy = true;
     try {
       const c = await cfg();
       if (c.hide) return;
-      const s = await getScene(id);
-      const req = isRequested(s, c);
-      const ups = [];
-      for (const [host, player] of [[bar, true], [tb, false]]) {
-        if (!host) continue;
+      const states = {};
+      for (const [host, player, sid] of todo) {
+        if (!(sid in states)) {
+          const sc = await getScene(sid);
+          states[sid] = { req: isRequested(sc, c), later: hasTag(sc, c.later) };
+        }
+        if (!document.contains(host)) continue;
         host.querySelectorAll(".wu-btn").forEach((x) => x.remove());
-        host.dataset.wuSid = id;
+        host.dataset.wuSid = sid;
         const wrap = player ? host : document.createElement("span");
         if (!player) {
           wrap.className = "wu-btn";
@@ -168,13 +427,14 @@
           }
         }
         const ref = player ? host.querySelector(".vjs-fullscreen-control") : null;
-        const up = mk("wu-btn wu-up", "⬆", () => upgrade(ups), player);
-        look(up, req);
-        ups.push(up);
+        const up = mk("wu-btn wu-up", "⬆", upgrade, player, sid);
+        up._req = states[sid].req;
+        paint(up);
+        status(sid).then((st) => { if (st && !st.error) { up._st = st; paint(up); } });
         wrap.insertBefore(up, ref);
         if (c.enableDelete) {
-          const d = mk("wu-btn wu-del", "🗑", del, player);
-          d.title = "Delete scene + file (and exclude in Whisparr)";
+          const d = mk("wu-btn wu-del", "🗑", del, player, sid);
+          paintDel(d, states[sid].later);
           wrap.insertBefore(d, ref);
         }
       }
@@ -184,6 +444,24 @@
       busy = false;
     }
   }
+
+  // Right-click (or long-press) or Shift+click on ⬆: search the indexers now.
+  // Listened for on the whole page, so it still works if a theme rebuilds the player's buttons,
+  // and before anything else so neither Chrome's nor DirtyMultiscreen's menu opens.
+  function upFrom(e) { return e.target && e.target.closest ? e.target.closest(".wu-up") : null; }
+  document.addEventListener("contextmenu", (e) => {
+    const b = upFrom(e);
+    if (!b) return;
+    e.preventDefault(); e.stopImmediatePropagation();
+    checkNow(b);
+  }, true);
+  document.addEventListener("click", (e) => {
+    if (!e.shiftKey) return;
+    const b = upFrom(e);
+    if (!b) return;
+    e.preventDefault(); e.stopImmediatePropagation();
+    checkNow(b);
+  }, true);
 
   let t = null;
   new MutationObserver(() => {

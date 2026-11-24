@@ -1,6 +1,6 @@
 name: Whisparr Upgrade
 description: Request a better-quality version of a scene from Whisparr with one click (the upgraded file is merged back into the scene, keeping markers, rating and play history). Optional one-click delete that also excludes the scene in Whisparr so it is never re-downloaded.
-version: 2.2.0
+version: 2.6.0
 exec:
   - python
   - "{pluginDir}/whisparr_upgrade.py"
@@ -35,7 +35,7 @@ settings:
     type: BOOLEAN
   HIDE_BUTTONS:
     displayName: Hide the ⬆ / 🗑 buttons
-    description: Use the tags only, without buttons on the scene page and player.
+    description: Use the tags only, without buttons on the scene page, the player and DirtyMultiscreen screens.
     type: BOOLEAN
   UPGRADE_TAG:
     displayName: Upgrade tag (default "Upgrade")
@@ -45,4 +45,8 @@ settings:
     type: STRING
   DELETE_TAG:
     displayName: Delete tag (default "Delete")
+    type: STRING
+  DELETE_LATER_TAG:
+    displayName: Delete-later tag (default "Delete Later")
+    description: Added by "Tag it to delete later" in the 🗑 dialog. Only marks the scene - nothing is deleted.
     type: STRING

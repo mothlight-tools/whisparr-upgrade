@@ -1,8 +1,8 @@
 - id: whisparr-upgrade
   name: Whisparr Upgrade
   metadata:
-    description: One-click "find a better version" via Whisparr, merged back into the scene. Optional one-click delete + Whisparr exclusion.
-  version: 2.2.0
-  date: "2026-11-05 00:00:00"
+    description: One-click "find a better version" via Whisparr, merged back into the scene. Shows when a file is below your quality target and checks your indexers for better releases. Optional delete (now, or tag to delete later) + Whisparr exclusion.
+  version: 2.6.0
+  date: "2026-11-24 13:29:35"
   path: whisparr-upgrade.zip
-  sha256: bc8be95cb3d2d3b613de4b49f33236847cb8a2fcd3d846c948dd81bd503163c5
+  sha256: 960402e48e9c61673162f5f49492048aa342b7e6288f278d3451e5608610587c

@@ -10,6 +10,11 @@ Scene.Create.Post
     play history, tags), drop the PENDING tag, and stop monitoring the scene in Whisparr
     (unless KEEP_MONITORING is on) so it isn't upgraded again or re-downloaded if deleted.
 
+Run from the browser (runPluginOperation, no hook):
+  * mode "status", ids [...] -> each scene's file quality vs the quality profile's target in Whisparr.
+  * mode "check", id        -> ask Whisparr to search the indexers now and report better releases.
+    Nothing is downloaded by either.
+
 Requires: stashapp-tools (pip install stashapp-tools), which also installs requests.
 """
 import json
@@ -131,12 +136,111 @@ def merge_upgraded(stash, cfg, new_scene):
         return
 
 
+NOMINAL = [2160, 1440, 1080, 720, 576, 480, 360, 240]
+FRAG_FILES = FRAG.replace("files { path }", "files { path height width size }")
+_profiles = {}
+
+
+def nominal(height, width=0):
+    """Treat 1920x800 or 1920x1072 as 1080p, etc."""
+    h = max(height or 0, int((width or 0) * 9 / 16))
+    for n in NOMINAL:
+        if h >= n * 0.9:
+            return n
+    return h
+
+
+def res_label(res, name=None):
+    if res >= 2160:
+        return "4K"
+    return f"{res}p" if res else (name or "?")
+
+
+def profile_target(cfg, pid):
+    """(name, resolution) of the quality profile's cutoff - the quality Whisparr upgrades up to."""
+    if pid not in _profiles:
+        r = requests.get(f"{cfg['url']}/api/v3/qualityprofile/{pid}",
+                         headers={"X-Api-Key": cfg["key"]}, timeout=30)
+        r.raise_for_status()
+        p = r.json()
+        cut, name, res = p.get("cutoff"), None, 0
+        for it in p.get("items") or []:
+            q = it.get("quality")
+            if q and q.get("id") == cut:
+                name, res = q.get("name"), q.get("resolution") or 0
+            elif not q and it.get("id") == cut:
+                kids = [k.get("quality") or {} for k in it.get("items") or []]
+                name = it.get("name")
+                res = max([k.get("resolution") or 0 for k in kids] or [0])
+        _profiles[pid] = (name, res)
+    return _profiles[pid]
+
+
+def scene_status(stash, cfg, scene_id):
+    scene = stash.find_scene(scene_id, fragment=FRAG_FILES)
+    if not scene:
+        return {"error": "scene not found"}
+    files = scene.get("files") or []
+    cur = max([nominal(f.get("height"), f.get("width")) for f in files] or [0])
+    size = max([f.get("size") or 0 for f in files] or [0])
+    out = {"currentRes": cur, "current": res_label(cur), "sizeGB": round(size / 1e9, 2)}
+    sid = stashdb_id(scene)
+    if not sid:
+        out["linked"] = False
+        return out
+    movies = whisparr_movies(cfg, sid)
+    if not movies:
+        out["inWhisparr"] = False
+        return out
+    m = movies[0]
+    out["movieId"] = m["id"]
+    out["monitored"] = bool(m.get("monitored"))
+    tname, tres = profile_target(cfg, m.get("qualityProfileId"))
+    out["target"], out["targetRes"] = res_label(tres, tname), tres
+    mf = m.get("movieFile")
+    if mf and "qualityCutoffNotMet" in mf:
+        out["below"] = bool(mf["qualityCutoffNotMet"])
+    else:
+        out["below"] = bool(tres) and cur < tres
+    return out
+
+
+def check_releases(stash, cfg, scene_id):
+    st = scene_status(stash, cfg, scene_id)
+    if "movieId" not in st:
+        return dict(st, error="This scene isn't linked to Whisparr" if st.get("linked") is False
+                    else "This scene isn't in Whisparr")
+    r = requests.get(f"{cfg['url']}/api/v3/release", params={"movieId": st["movieId"]},
+                     headers={"X-Api-Key": cfg["key"]}, timeout=240)
+    r.raise_for_status()
+    better = []
+    for rel in r.json():
+        q = (rel.get("quality") or {}).get("quality") or {}
+        res = q.get("resolution") or 0
+        if res <= st["currentRes"]:
+            continue
+        if rel.get("protocol") == "torrent" and (rel.get("seeders") or 0) < 1:
+            continue
+        better.append({
+            "title": rel.get("title"),
+            "quality": q.get("name"),
+            "res": res,
+            "sizeGB": round((rel.get("size") or 0) / 1e9, 1),
+            "indexer": rel.get("indexer"),
+            "seeders": rel.get("seeders"),
+            "approved": bool(rel.get("approved")),
+        })
+    better.sort(key=lambda b: (-b["res"], not b["approved"], -(b["seeders"] or 0)))
+    best = better[0]["res"] if better else 0
+    return dict(st, better=len(better), bestRes=best, best=res_label(best) if best else None,
+                bestSizeGB=better[0]["sizeGB"] if better else None, top=better[:3])
+
+
 def main():
     data = json.loads(sys.stdin.read())
     stash = StashInterface(data["server_connection"])
-    hook = (data.get("args") or {}).get("hookContext") or {}
-    if not hook.get("id"):
-        done("no hook context")
+    args = data.get("args") or {}
+    hook = args.get("hookContext") or {}
     raw = (stash.get_configuration().get("plugins") or {}).get(PLUGIN_ID, {})
     cfg = {
         "url": (raw.get("WHISPARR_URL") or "http://localhost:6969").rstrip("/"),
@@ -147,6 +251,24 @@ def main():
         "enable_delete": bool(raw.get("ENABLE_DELETE")),
         "keep_monitoring": bool(raw.get("KEEP_MONITORING")),
     }
+    if not hook.get("id"):
+        mode = args.get("mode")
+        if mode in ("status", "check"):
+            if not cfg["key"]:
+                done({"error": "Whisparr API key not set in the plugin settings"})
+            try:
+                if mode == "status":
+                    out = {}
+                    for i in (args.get("ids") or [])[:50]:
+                        try:
+                            out[str(i)] = scene_status(stash, cfg, i)
+                        except Exception as e:
+                            out[str(i)] = {"error": str(e)}
+                    done(out)
+                done(check_releases(stash, cfg, args.get("id")))
+            except Exception as e:
+                done({"error": str(e)})
+        done("no hook context")
     scene = stash.find_scene(hook["id"], fragment=FRAG)
     if not scene:
         done("scene not found")
