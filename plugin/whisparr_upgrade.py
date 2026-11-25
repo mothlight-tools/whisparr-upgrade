@@ -14,14 +14,21 @@ Run from the browser (runPluginOperation, no hook):
   * mode "status", ids [...] -> each scene's file quality vs the quality profile's target in Whisparr.
   * mode "check", id        -> ask Whisparr to search the indexers now and report better releases
                                (with size, bitrate and a low-bitrate warning). Nothing is downloaded.
-  * mode "grab", id, guid, indexerId -> download that one release (as Whisparr's Interactive Search
-                               does), and mark the scene Upgrade Requested so it is merged on import.
+  * mode "grab", id, guid, indexerId[, override] -> download that one release (as Whisparr's Interactive
+                               Search does), and mark the scene Upgrade Requested so it is merged on import.
+                               override = a release Whisparr couldn't match to the scene itself.
+  * mode "maintain"         -> run every few minutes by the buttons: imports downloads you picked that
+                               Whisparr holds back for a Manual Import, and (if set) gives up on upgrade
+                               requests older than "Give up after N days".
 
 Requires: stashapp-tools (pip install stashapp-tools), which also installs requests.
 """
+import fcntl
 import json
+import os
 import re
 import sys
+import time
 
 import requests
 import stashapi.log as log
@@ -29,6 +36,10 @@ from stashapi.stashapp import StashInterface
 
 PLUGIN_ID = "whisparr-upgrade"
 UUID_RE = re.compile(r"\[([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\]")
+HERE = os.path.dirname(os.path.abspath(__file__))
+PICKS = os.path.join(HERE, ".picked-grabs.json")        # releases picked here, imported by "maintain"
+REQUESTS = os.path.join(HERE, ".upgrade-requests.json")  # when each scene's upgrade was requested
+PICK_DAYS = 14   # how long a picked download is watched for its import
 FRAG = "id title tags { id name } stash_ids { endpoint stash_id } files { path }"
 
 
@@ -62,6 +73,34 @@ def whisparr_movies(cfg, sid):
     return [m for m in r.json() if m.get("stashId") == sid]
 
 
+def whisparr(cfg, method, path, body=None):
+    r = requests.request(method, cfg["url"] + path, json=body, headers={"X-Api-Key": cfg["key"]}, timeout=60)
+    r.raise_for_status()
+    return r.json() if r.text else None
+
+
+def _load(path, default):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except Exception:
+        return default
+
+
+def _save(path, value):
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(value, f)
+    os.replace(tmp, path)
+
+
+def note_request(scene_id):
+    """Remember when a scene's upgrade was asked for (used by "Give up after N days")."""
+    req = _load(REQUESTS, {})
+    req[str(scene_id)] = time.time()
+    _save(REQUESTS, req)
+
+
 def request_upgrade(stash, cfg, scene):
     sid = stashdb_id(scene)
     if not sid:
@@ -73,11 +112,20 @@ def request_upgrade(stash, cfg, scene):
         return
     h = {"X-Api-Key": cfg["key"]}
     mid = movies[0]["id"]
+    try:
+        st = scene_status(stash, cfg, scene["id"])
+        if st.get("below") is False and st.get("targetRes"):
+            log.warning(f"[Upgrade] '{scene['title']}' is already {st['current']}, which meets your Whisparr target "
+                        f"({st['target']}) - Whisparr won't download a better version on its own. Use 'Search now and "
+                        "pick a release myself' on the ⬆ button, or raise the cutoff in the quality profile.")
+    except Exception:
+        pass
     requests.put(f"{cfg['url']}/api/v3/movie/editor", json={"movieIds": [mid], "monitored": True},
                  headers=h, timeout=30).raise_for_status()
     requests.post(f"{cfg['url']}/api/v3/command", json={"name": "MoviesSearch", "movieIds": [mid]},
                   headers=h, timeout=30).raise_for_status()
     set_tags(stash, scene, {cfg["upgrade"].lower()}, tag_id(stash, cfg["pending"]))
+    note_request(scene["id"])
     log.info(f"[Upgrade] Whisparr is searching for a better version of '{scene['title']}'")
 
 
@@ -226,31 +274,130 @@ def indexer_priorities(cfg):
         return {}
 
 
+# ---------- does a release look like this scene? (same rules as StashPicker) ----------
+PACK_RE = re.compile(r"\b(pack|megapack|collection|parts?\s*\d+\s*(-|–|&|,|and|to)\s*\d+|\d+\s*(scenes|videos|clips|episodes))\b", re.I)
+HIGH_MBPS = {2160: 120, 1440: 70, 1080: 40, 720: 20, 576: 12, 480: 10}   # way above one normal scene
+LIKELY = 4   # likeness score from which a release Whisparr couldn't match is flagged "likely this scene"
+BITRATE_UP = 1.5   # same resolution counts as better when your file is low bitrate and this is 1.5x or more
+_STOP = {"the", "and", "with", "her", "his", "for", "xxx", "from", "gets", "into", "your", "that", "this", "step"}
+_PART_WORDS = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "i": 1, "ii": 2, "iii": 3, "iv": 4}
+
+
+def _words(s):
+    return re.findall(r"[a-z0-9]+", (s or "").lower())
+
+
+def _close(a, b):
+    """Same word, or one letter added/removed/changed (Lily ~ Lilly) for words of 4+ letters."""
+    if a == b:
+        return True
+    if min(len(a), len(b)) < 4 or abs(len(a) - len(b)) > 1:
+        return False
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        cur = [i]
+        for j, cb in enumerate(b, 1):
+            cur.append(min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (ca != cb)))
+        prev = cur
+    return prev[-1] <= 1
+
+
+def _part(text):
+    """'Part Two' / 'Pt. 2' / 'Part II' -> 2 (None when the name has no part number)."""
+    m = re.search(r"\b(?:part|pt)\.?\s*(\d+|one|two|three|four|five|iv|iii|ii|i)\b", (text or "").lower())
+    if not m:
+        return None
+    v = m.group(1)
+    return int(v) if v.isdigit() else _PART_WORDS[v]
+
+
+def scene_hint(mv):
+    """What a release name for this scene usually contains: date, studio, performers, title words."""
+    d = (mv.get("releaseDate") or "")[:10].split("-")
+    performers = [w for w in (_words(n) for n in (mv.get("performerNames") or [])) if w]
+    pwords = {w for p in performers for w in p}
+    return {
+        "dates": [f"{d[0][2:]} {d[1]} {d[2]}", f"{d[0]} {d[1]} {d[2]}"] if len(d) == 3 else [],
+        "studio": "".join(_words(mv.get("studioTitle"))),
+        "performers": performers,
+        "part": _part(mv.get("title")),
+        "title": [w for w in _words(mv.get("title"))
+                  if len(w) >= 4 and w not in _STOP and not any(_close(w, p) for p in pwords)],
+    }
+
+
+def likeness(hint, release_title):
+    """Points for how much a release name looks like this scene: date 3, studio 2, each performer 2, title up to 2."""
+    words = _words(release_title)
+    joined, compact = " " + " ".join(words) + " ", "".join(words)
+    score = 0
+    if any(f" {d} " in joined for d in hint["dates"]):
+        score += 3
+    if hint["studio"] and hint["studio"] in compact:
+        score += 2
+    for p in hint["performers"][:4]:
+        if all(any(_close(pw, w) for w in words) for pw in p):
+            score += 2
+    if hint.get("part"):   # "Part One" vs "Part Two" of the same scene: the number decides
+        p = _part(release_title)
+        if p:
+            score += 2 if p == hint["part"] else -3
+    if hint["title"]:
+        hit = sum(1 for tw in hint["title"] if any(_close(tw, w) for w in words)) / len(hint["title"])
+        score += 2 if hit >= 0.6 else 1 if hit >= 0.3 else 0
+    return score
+
+
+def _reason(x):
+    return x[:-2].rstrip() if x.endswith("[]") else x
+
+
 def check_releases(stash, cfg, scene_id):
+    """Search the indexers now. Releases Whisparr matched to this scene and that beat your file go in "top";
+    better-quality releases Whisparr couldn't match (often the same scene under a network name or a re-release
+    date) go in "others", most alike first, flagged likely when the name scores >= LIKELY."""
     st = scene_status(stash, cfg, scene_id)
     if "movieId" not in st:
         return dict(st, error="This scene isn't linked to Whisparr" if st.get("linked") is False
                     else "This scene isn't in Whisparr")
     dur = st.get("durationSec") or 0
+    cur = st["currentRes"]
+    cur_mbps = st.get("mbps")
+    cur_low = bool(cur_mbps is not None and cur_mbps < LOW_MBPS.get(nominal(cur), 0))
     prio = indexer_priorities(cfg)
-    better = []
+    try:
+        mv = whisparr(cfg, "GET", f"/api/v3/movie/{int(st['movieId'])}") or {}
+    except Exception:
+        mv = {}
+    hint = scene_hint(mv)
+    top, others = [], []
     for rel in search_releases(cfg, st["movieId"]):
         q = (rel.get("quality") or {}).get("quality") or {}
         res = q.get("resolution") or 0
-        if res <= st["currentRes"]:
-            continue
         if rel.get("protocol") == "torrent" and (rel.get("seeders") or 0) < 1:
             continue
         size = rel.get("size") or 0
+        title = rel.get("title") or ""
         mbps = round(size * 8 / dur / 1e6, 1) if dur and size else None
-        better.append({
-            "title": rel.get("title"),
+        low = bool(mbps is not None and mbps < LOW_MBPS.get(nominal(res), 0))
+        pack = bool(PACK_RE.search(title) or (mbps and mbps > HIGH_MBPS.get(nominal(res), 999)))
+        # Better = higher resolution, or the same resolution when your file is low bitrate and this one is
+        # a normal bitrate and clearly higher (a pack's size says nothing about one scene's bitrate).
+        bitrate_up = (nominal(res) == nominal(cur) and cur_low and not low and not pack
+                      and mbps is not None and cur_mbps and mbps >= cur_mbps * BITRATE_UP)
+        if res <= cur and not bitrate_up:
+            continue
+        match = rel.get("mappedMovieId") == int(st["movieId"])
+        row = {
+            "title": title,
             "quality": q.get("name"),
             "res": res,
             "label": res_label(res),
             "sizeGB": round(size / 1e9, 1),
             "mbps": mbps,
-            "low": bool(mbps is not None and mbps < LOW_MBPS.get(nominal(res), 0)),
+            "low": low,
+            "pack": pack,
+            "bitrateUp": bool(bitrate_up),
             "indexer": rel.get("indexer"),
             "indexerId": rel.get("indexerId"),
             "priority": prio.get(rel.get("indexerId"), 25),
@@ -258,18 +405,29 @@ def check_releases(stash, cfg, scene_id):
             "protocol": rel.get("protocol"),
             "seeders": rel.get("seeders"),
             "approved": bool(rel.get("approved")),
+            "match": match,
+            "score": likeness(hint, title),
+            "reasons": [_reason(x) for x in (rel.get("rejections") or [])],
             "rejection": ((rel.get("rejections") or [None])[0]),
-        })
+        }
+        row["likely"] = not match and row["score"] >= LIKELY
+        (top if match else others).append(row)
     # Highest resolution first; then normal bitrate before low, then your Whisparr indexer priority
     # (1 = most preferred, like Whisparr itself), then larger, then more seeders.
-    better.sort(key=lambda b: (-b["res"], b["low"], b["priority"], -b["sizeGB"], -(b["seeders"] or 0)))
-    top = better[0] if better else None
-    return dict(st, better=len(better), bestRes=top["res"] if top else 0, best=top["label"] if top else None,
-                bestSizeGB=top["sizeGB"] if top else None, bestMbps=top["mbps"] if top else None,
-                bestLow=top["low"] if top else False, top=better[:40])
+    rank = lambda b: (-b["res"], b["low"], b["pack"], b["priority"], -b["sizeGB"], -(b["seeders"] or 0))
+    top.sort(key=rank)
+    others.sort(key=lambda b: (-b["score"],) + rank(b))
+    best = top[0] if top else None
+    scene = {"title": mv.get("title"), "studio": mv.get("studioTitle"), "date": (mv.get("releaseDate") or "")[:10],
+             "performers": mv.get("performerNames") or []}
+    return dict(st, better=len(top), bestRes=best["res"] if best else 0, best=best["label"] if best else None,
+                bestSizeGB=best["sizeGB"] if best else None, bestMbps=best["mbps"] if best else None,
+                bestLow=best["low"] if best else False, bestBitrateUp=best["bitrateUp"] if best else False,
+                curLow=cur_low, top=top[:40], others=others[:40],
+                likely=sum(1 for o in others if o["likely"]), scene=scene)
 
 
-def grab_release(stash, cfg, scene_id, guid, indexer_id):
+def grab_release(stash, cfg, scene_id, guid, indexer_id, override=False):
     """Download one specific release, like Whisparr's Interactive Search, then mark the scene pending."""
     scene = stash.find_scene(scene_id, fragment=FRAG)
     if not scene:
@@ -279,6 +437,8 @@ def grab_release(stash, cfg, scene_id, guid, indexer_id):
         return {"error": "This scene isn't in Whisparr"}
     h = {"X-Api-Key": cfg["key"]}
     body = {"guid": guid, "indexerId": indexer_id}
+    if override:   # a release Whisparr could not match itself: tell it which scene it is for
+        body["movieId"] = int(st["movieId"])
 
     def push():
         return requests.post(f"{cfg['url']}/api/v3/release", json=body, headers=h, timeout=120)
@@ -298,9 +458,123 @@ def grab_release(stash, cfg, scene_id, guid, indexer_id):
         except Exception:
             msg = r.text
         return {"error": f"Whisparr refused it: {str(msg)[:200]}"}
+    # Remembered so "maintain" can finish the import if Whisparr holds it back (picked by hand, or the same
+    # resolution as your file). Only downloads picked here are ever imported that way.
+    picks = [p for p in _load(PICKS, []) if p.get("movieId") != int(st["movieId"])]
+    _save(PICKS, picks + [{"movieId": int(st["movieId"]), "sceneId": str(scene_id), "t": time.time()}])
     set_tags(stash, scene, {cfg["upgrade"].lower()}, tag_id(stash, cfg["pending"]))
+    note_request(scene_id)
     log.info(f"[Upgrade] Sent the chosen release for '{scene['title']}' to the download client")
     return {"ok": True}
+
+
+# Import holds that are fine to override for a release you picked yourself.
+_OK_HOLD = re.compile(r"by ID|Manual Import required|not an upgrade|upgrade|cutoff|quality", re.I)
+
+
+def finish_imports(cfg):
+    """Import finished downloads you picked from the ⬆ list that Whisparr holds back ("matched to movie by ID ...
+    Manual Import required", or "not an upgrade" for a same-resolution, higher-bitrate file). Only the one
+    file that is this scene is imported - for a pack, only a clear match; anything unclear stays for you to
+    Manual Import in Whisparr."""
+    picks = [p for p in _load(PICKS, []) if time.time() - p.get("t", 0) < PICK_DAYS * 86400]
+    mine = {p["movieId"] for p in picks}
+    imported, skipped = [], []
+    if mine:
+        queue = whisparr(cfg, "GET", "/api/v3/queue?pageSize=200") or {}
+        for it in queue.get("records") or []:
+            if it.get("movieId") not in mine or it.get("trackedDownloadState") not in ("importBlocked", "importFailed"):
+                continue
+            msgs = " ".join(m for s in (it.get("statusMessages") or []) for m in (s.get("messages") or []))
+            if not _OK_HOLD.search(msgs):
+                skipped.append(it.get("title"))
+                continue
+            files = whisparr(cfg, "GET", f"/api/v3/manualimport?downloadId={it['downloadId']}&movieId={it['movieId']}"
+                                         "&filterExistingFiles=false") or []
+            videos = [f for f in files if (f.get("size") or 0) > 50e6]
+            f = None
+            if len(videos) == 1:
+                f = videos[0]
+            elif len(videos) > 1:   # a pack: only the file that clearly is this scene
+                try:
+                    hint = scene_hint(whisparr(cfg, "GET", f"/api/v3/movie/{it['movieId']}") or {})
+                    sc = sorted(((likeness(hint, v.get("relativePath") or v.get("name") or ""), i)
+                                 for i, v in enumerate(videos)), reverse=True)
+                    if sc[0][0] >= LIKELY and sc[0][0] >= sc[1][0] + 2:
+                        f = videos[sc[0][1]]
+                except Exception:
+                    f = None
+            bad = [r.get("reason", "") for r in (f or {}).get("rejections") or [] if not _OK_HOLD.search(r.get("reason", ""))]
+            if not f or bad:
+                skipped.append(it.get("title"))
+                mine.discard(it["movieId"])   # left for a Manual Import - don't keep trying
+                continue
+            whisparr(cfg, "POST", "/api/v3/command", {"name": "ManualImport", "importMode": "auto", "files": [{
+                "path": f["path"], "folderName": f.get("folderName"), "movieId": it["movieId"], "quality": f.get("quality"),
+                "languages": f.get("languages") or [], "releaseGroup": f.get("releaseGroup"),
+                "downloadId": it["downloadId"], "indexerFlags": f.get("indexerFlags") or 0}]})
+            imported.append(it.get("title"))
+            mine.discard(it["movieId"])
+    _save(PICKS, [p for p in picks if p["movieId"] in mine])
+    for t in imported:
+        log.info(f"[Upgrade] Imported '{t}' into Whisparr (you picked it, so Whisparr needed a Manual Import)")
+    for t in skipped:
+        log.warning(f"[Upgrade] '{t}' needs a Manual Import in Whisparr (Activity → Queue) - not clear which file is the scene")
+    return {"imported": imported, "skipped": skipped}
+
+
+def expire_requests(stash, cfg):
+    """Give up on upgrade requests older than PENDING_DAYS: drop the pending tag and stop monitoring."""
+    req = _load(REQUESTS, {})
+    pending = stash.find_scenes({"tags": {"value": [tag_id(stash, cfg["pending"])], "modifier": "INCLUDES"}},
+                                fragment=FRAG) or []
+    now, keep, gave_up = time.time(), {}, []
+    for s in pending:
+        t = req.get(str(s["id"]))
+        if t is None:   # requested before 2.9.0: start counting now
+            t = now
+        if cfg["pending_days"] and now - t > cfg["pending_days"] * 86400:
+            set_tags(stash, s, {cfg["pending"].lower()})
+            sid = stashdb_id(s)
+            if sid and not cfg["keep_monitoring"]:
+                try:
+                    ids = [m["id"] for m in whisparr_movies(cfg, sid)]
+                    if ids:
+                        whisparr(cfg, "PUT", "/api/v3/movie/editor", {"movieIds": ids, "monitored": False})
+                except Exception as e:
+                    log.warning(f"[Upgrade] Couldn't stop monitoring '{s['title']}' in Whisparr: {e}")
+            gave_up.append(s["title"])
+            log.info(f"[Upgrade] No better version of '{s['title']}' in {cfg['pending_days']} days - gave up "
+                     f"(removed '{cfg['pending']}'" + ("" if cfg["keep_monitoring"] else ", stopped monitoring") + ")")
+        else:
+            keep[str(s["id"])] = t
+    _save(REQUESTS, keep)
+    return gave_up
+
+
+def maintain(stash, cfg):
+    """Housekeeping the buttons ask for every few minutes. Runs at most once per 4 minutes, one at a time."""
+    lock = open(os.path.join(HERE, ".maintain.lock"), "a+")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return {"busy": True}
+    lock.seek(0)
+    try:
+        last = float(lock.read().strip() or 0)
+    except ValueError:
+        last = 0
+    if time.time() - last < 240:
+        return {"recent": True}
+    lock.seek(0)
+    lock.truncate()
+    lock.write(str(time.time()))
+    lock.flush()
+    out = {"imported": [], "skipped": [], "gaveUp": []}
+    if cfg["auto_import"]:
+        out.update(finish_imports(cfg))
+    out["gaveUp"] = expire_requests(stash, cfg)
+    return out
 
 
 def main():
@@ -317,10 +591,12 @@ def main():
         "delete": raw.get("DELETE_TAG") or "Delete",
         "enable_delete": bool(raw.get("ENABLE_DELETE")),
         "keep_monitoring": bool(raw.get("KEEP_MONITORING")),
+        "auto_import": not raw.get("NO_AUTO_IMPORT"),
+        "pending_days": max(0, int(raw.get("PENDING_DAYS") or 0)),
     }
     if not hook.get("id"):
         mode = args.get("mode")
-        if mode in ("status", "check", "grab"):
+        if mode in ("status", "check", "grab", "maintain"):
             if not cfg["key"]:
                 done({"error": "Whisparr API key not set in the plugin settings"})
             try:
@@ -333,7 +609,10 @@ def main():
                             out[str(i)] = {"error": str(e)}
                     done(out)
                 if mode == "grab":
-                    done(grab_release(stash, cfg, args.get("id"), args.get("guid"), args.get("indexerId")))
+                    done(grab_release(stash, cfg, args.get("id"), args.get("guid"), args.get("indexerId"),
+                                      bool(args.get("override"))))
+                if mode == "maintain":
+                    done(maintain(stash, cfg))
                 done(check_releases(stash, cfg, args.get("id")))
             except Exception as e:
                 done({"error": str(e)})

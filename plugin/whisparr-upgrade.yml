@@ -1,6 +1,6 @@
 name: Whisparr Upgrade
 description: Request a better-quality version of a scene from Whisparr with one click (the upgraded file is merged back into the scene, keeping markers, rating and play history). Optional one-click delete that also excludes the scene in Whisparr so it is never re-downloaded.
-version: 2.8.0
+version: 2.9.0
 exec:
   - python
   - "{pluginDir}/whisparr_upgrade.py"
@@ -32,6 +32,14 @@ settings:
   KEEP_MONITORING:
     displayName: Keep monitoring after an upgrade arrives
     description: Off by default - once the better file is in, the scene is unmonitored in Whisparr so it isn't upgraded again or re-downloaded if you delete it. Turn on to let Whisparr keep looking after it.
+    type: BOOLEAN
+  PENDING_DAYS:
+    displayName: Give up on an upgrade after N days (0 = never)
+    description: If no better version has arrived N days after you asked, the "Upgrade Requested" tag is removed and the scene is unmonitored in Whisparr (unless "Keep monitoring" is on). Off when 0 or empty.
+    type: NUMBER
+  NO_AUTO_IMPORT:
+    displayName: Don't finish imports of picked releases for me
+    description: Off by default - a release you pick from the ⬆ list that Whisparr holds back (it couldn't match it itself, or it's the same resolution as your file) is imported into the scene automatically when it finishes (packs - only a clear match). Turn on to always do those Manual Imports in Whisparr yourself.
     type: BOOLEAN
   HIDE_BUTTONS:
     displayName: Hide the ⬆ / 🗑 buttons
