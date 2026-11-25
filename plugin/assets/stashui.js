@@ -85,13 +85,79 @@ function sizeLine(cur, c) {
   }
   return t;
 }
-// One release as two lines for the picker / tooltip.
-function relLines(r) {
-  const a = [r.label || "?", r.quality, gb(r.sizeGB), r.mbps != null ? "~" + r.mbps + " Mbps" : null].filter(Boolean).join(" · ");
-  const b = [r.indexer, r.seeders != null ? r.seeders + " seeder" + (r.seeders === 1 ? "" : "s") : (r.protocol === "usenet" ? "usenet" : null),
-    r.low ? "⚠ low bitrate" : null, r.approved ? "✓ Whisparr's own pick" : null].filter(Boolean).join(" · ");
-  return [a, b];
+// Whisparr's reasons for not taking a release itself, in plain words.
+function plain(x) {
+  const s = String(x || "");
+  if (/unknown movie|unable to match/i.test(s)) return "Whisparr couldn't tell from the name which scene this is";
+  if (/meets cutoff|cutoff (has been |already )?met/i.test(s)) return "your file already meets your quality target";
+  if (/not an upgrade|existing file/i.test(s)) return "not an upgrade by your quality profile's rules";
+  if (/not wanted in profile|quality .*not wanted/i.test(s)) return "this quality isn't allowed in your quality profile";
+  if (/blocklist/i.test(s)) return "on your blocklist";
+  if (/size|too large|too small/i.test(s)) return "outside your size limits";
+  if (/custom format|score/i.test(s)) return "custom format score too low";
+  return s;
 }
+// One release as lines for the picker / tooltip (full = also say why Whisparr wouldn't take it itself).
+function relLines(r, full) {
+  const a = [(r.pack ? "📦 " : "") + (r.label || "?"), r.quality, gb(r.sizeGB), r.mbps != null ? "~" + r.mbps + " Mbps" : null].filter(Boolean).join(" · ");
+  const b = [r.indexer, r.seeders != null ? r.seeders + " seeder" + (r.seeders === 1 ? "" : "s") : (r.protocol === "usenet" ? "usenet" : null),
+    r.low ? "⚠ low bitrate" : null, r.bitrateUp ? "same resolution, higher bitrate" : null,
+    r.pack ? "pack: several scenes" : null, r.approved ? "★ Whisparr's pick" : null,
+    r.likely ? "🔎 name looks like this scene" : null].filter(Boolean).join(" · ");
+  const out = [a, b];
+  if (full && !r.approved) {
+    const why = [...new Set((r.reasons && r.reasons.length ? r.reasons : [r.rejection]).filter(Boolean).map(plain))];
+    if (why.length) out.push("Not auto: " + why.slice(0, 2).join("; "));
+  }
+  if (full && r.title) out.push(r.title.length > 90 ? r.title.slice(0, 88) + "…" : r.title);
+  return out;
+}
+// A check found something worth picking: matched releases, or unmatched ones whose name looks like this scene.
+const worth = (d) => !!(d && !d.error && (d.better || d.likely));
+const bestTxt = (d) => d.better ? d.best : (((d.others || []).find((o) => o.likely) || {}).label || "?") + "?";
+// The picker's list: Whisparr's matched releases first (★ pick in green), then the ones it couldn't match.
+function relOptions(data, order) {
+  const opts = [];
+  const top = sortRel((data.top || []).filter((r) => r.guid), order);
+  top.sort((a, b) => (b.approved ? 1 : 0) - (a.approved ? 1 : 0));
+  if (top.length) {
+    opts.push({ head: "Matched to this scene by Whisparr" });
+    top.slice(0, 15).forEach((r) => opts.push({ label: relLines(r, true).join("\n"), value: r, green: r.approved }));
+  }
+  const others = (data.others || []).filter((r) => r.guid);
+  const shown = others.filter((r) => r.likely).concat(top.length ? [] : others.filter((r) => !r.likely).slice(0, 3)).slice(0, 10);
+  if (shown.length) {
+    opts.push({ head: "Not matched by Whisparr (🔎 = the name looks like this scene)" });
+    shown.forEach((r) => opts.push({ label: relLines(r, true).join("\n"), value: r }));
+  }
+  return opts;
+}
+function lookingFor(data) {
+  const s = data.scene || {};
+  const bits = [s.studio, s.date, (s.performers || []).slice(0, 4).join(", ")].filter(Boolean);
+  return bits.length ? "Looking for: " + bits.join(" · ") + "\n" : "";
+}
+const PICK_HELP = "★ green = Whisparr's pick: matched and passes all your profile rules, so Whisparr would take it itself.\n" +
+  "⚠ = low bitrate for its resolution: often a heavy re-encode, an upscale or a shorter cut.  📦 = pack: only this scene's file is imported.\n";
+// Housekeeping every 5 min while Stash is open (one tab does it): finish imports Whisparr holds back for
+// releases you picked, and give up on old requests if you set "Give up after N days".
+function maintainLoop() {
+  const tick = () => {
+    try {
+      const last = +localStorage.getItem("wu-maintain") || 0;
+      if (Date.now() - last < 300000) return;
+      localStorage.setItem("wu-maintain", String(Date.now()));
+    } catch (e) {}
+    runOp({ mode: "maintain" }).catch(() => {});
+  };
+  setTimeout(tick, 20000);
+  setInterval(tick, 300000);
+}
+// A release Whisparr couldn't match and whose name doesn't look like this scene: ask first.
+const sure = (r) => choose("Download this one?",
+  "Whisparr couldn't match it to this scene and its name doesn't look much like it:\n\n" + r.title +
+  "\n\nIf it is the scene, it downloads and is imported into this scene for you.",
+  [{ label: "⬇  Yes, it's this scene", value: true, main: true }, { label: "Cancel", value: null }]);
 // How the release list is ordered. Remembered in this browser and shared with StashPicker.
 const ORDERS = [["res", "Quality"], ["indexer", "Indexer"], ["small", "Smallest"], ["large", "Largest"], ["seeders", "Seeders"]];
 const OK_KEY = "mothlight:releaseOrder";
@@ -159,6 +225,13 @@ function choose(title, text, options) {
     const key = (e) => { if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); finish(null); } else e.stopPropagation(); };
     let chips = null;
     for (const o of options) {
+      if (o.head) {
+        const hd = document.createElement("div");
+        hd.textContent = o.head;
+        hd.style.cssText = "margin:14px 0 0;font:700 11px system-ui,sans-serif;letter-spacing:.04em;text-transform:uppercase;opacity:.6";
+        box.appendChild(hd);
+        continue;
+      }
       if (o.chip) {
         if (!chips) {
           chips = document.createElement("div");
@@ -180,7 +253,7 @@ function choose(title, text, options) {
       b.textContent = o.label;
       b.style.cssText = "display:block;width:100%;margin-top:8px;padding:10px 12px;white-space:pre-line;line-height:1.35;border:0;border-radius:8px;cursor:pointer;text-align:left;" +
         "font:600 14px system-ui,sans-serif;color:#fff;background:" +
-        (o.danger ? "#c23030" : o.main ? "var(--pink,#ff3e8a)" : "rgba(255,255,255,.1)");
+        (o.danger ? "#c23030" : o.green ? "#2e7d32;box-shadow:inset 3px 0 0 #8bc34a" : o.main ? "var(--pink,#ff3e8a)" : "rgba(255,255,255,.1)");
       b.addEventListener("click", (e) => { e.stopPropagation(); finish(o.value); });
       box.appendChild(b);
     }
@@ -230,21 +303,23 @@ function paintUp(b, s) {
   if (chk) {
     const d = chk.data;
     if (d.error) lines.push("Last check failed: " + d.error);
-    else if (d.better) {
-      lines.push("Found " + d.better + " better release" + (d.better > 1 ? "s" : "") + " (" + ago(chk.at) + "):");
-      lines.push("  " + sizeLine(st && st.sizeGB != null ? st : d, d));
-      sortRel(d.top || [], getOrder()).slice(0, 3).forEach((r) => lines.push("  • " + relLines(r).join(" · ")));
+    else if (d.better || d.likely) {
+      if (d.better) {
+        lines.push("Found " + d.better + " better release" + (d.better > 1 ? "s" : "") + " (" + ago(chk.at) + "):");
+        lines.push("  " + sizeLine(st && st.sizeGB != null ? st : d, d));
+      } else lines.push("Whisparr matched nothing better, but " + d.likely + " release" + (d.likely > 1 ? "s look" : " looks") + " like this scene (" + ago(chk.at) + ")");
+      sortRel(d.top || [], getOrder()).concat((d.others || []).filter((r) => r.likely)).slice(0, 3).forEach((r) => lines.push("  • " + relLines(r).join(" · ")));
     } else lines.push("No better version found (" + ago(chk.at) + ")");
   }
   if (st && st.movieId) lines.push("Right-click or Shift+click to search the indexers now");
   b.title = lines.join("\n");
   b.style.color = req ? "#4caf50" : "";
   if (req) return;
-  if (chk && !chk.data.error && chk.data.better) {
-    badge.textContent = chk.data.best;
+  if (chk && worth(chk.data)) {
+    badge.textContent = bestTxt(chk.data);
     badge.style.display = "block";
     badge.style.background = "#00bcd4";
-  } else if (st && st.below && !(chk && !chk.data.error && !chk.data.better)) {
+  } else if (st && st.below && !(chk && !chk.data.error && !worth(chk.data))) {
     badge.textContent = "";
     Object.assign(badge.style, { display: "block", width: "7px", height: "7px", padding: "0", borderRadius: "50%", background: "#f5a623" });
   }
@@ -257,6 +332,7 @@ function paintDel(b, later) {
 
 export default function setup(stashui) {
   if (stashui.has && !stashui.has("slot:player.controls")) return;
+  maintainLoop();
   stashui.addSlot("player.controls", {
     id: "whisparr-upgrade",
     title: "Whisparr Upgrade",
@@ -277,8 +353,9 @@ export default function setup(stashui) {
           if (alive && up) paintUp(up, state);
           flash(ctx.video, data.error ? "Check failed: " + data.error
             : data.better ? "Better version available: " + sizeLine(state.st && state.st.sizeGB != null ? state.st : data, data)
+            : data.likely ? "Whisparr matched nothing better, but " + data.likely + " release(s) look like this scene"
             : "No better version found right now", 4500);
-          if (alive && !data.error && data.better) pick(data, Date.now());
+          if (alive && worth(data)) pick(data, Date.now());
         } catch (e) {
           flash(ctx.video, "Check failed: " + e.message, 4500);
         } finally {
@@ -303,25 +380,25 @@ export default function setup(stashui) {
           for (;;) {
             const order = getOrder();
             const opts = ORDERS.map(([k, name]) => ({ label: name, value: { sort: k }, chip: true, on: k === order }));
-            sortRel((data.top || []).filter((r) => r.guid), order).slice(0, 15)
-              .forEach((r) => opts.push({ label: relLines(r).join("\n"), value: r }));
+            opts.push(...relOptions(data, order));
             opts.push({ label: "⬆  Let Whisparr choose (uses your quality profile)", value: "auto", main: true });
             opts.push({ label: "Cancel", value: null });
             v = await choose(`Pick a version of "${sc.title || "this scene"}"`,
               "Your file: " + cur.current + ", " + gb(cur.sizeGB) + (cur.mbps ? ", ~" + cur.mbps + " Mbps" : "") +
-              "   (checked " + ago(at) + ")\n⚠ = low bitrate for its resolution: often a heavy re-encode, an upscale or a shorter cut.\n" +
+              "   (checked " + ago(at) + ")\n" + lookingFor(data) + PICK_HELP +
               "The one you pick downloads now and is merged into this scene when it arrives.", opts);
             if (v && v.sort) { setOrder(v.sort); continue; }
             break;
           }
           if (!v) return;
           if (v === "auto") return requestAuto(sc, c);
+          if (!v.match && !v.likely && !(await sure(v))) return;
           flash(ctx.video, "Sending " + v.label + " to the download client…", 10000);
-          const out = await runOp({ mode: "grab", id: state.id, guid: v.guid, indexerId: v.indexerId });
+          const out = await runOp({ mode: "grab", id: state.id, guid: v.guid, indexerId: v.indexerId, override: !v.match });
           if (!out || out.error) return flash(ctx.video, "Couldn't grab it: " + ((out && out.error) || "no answer"), 5000);
           state.req = true;
           if (alive && up) paintUp(up, state);
-          flash(ctx.video, "Downloading " + v.label + ", " + gb(v.sizeGB) + " – it will be merged into this scene", 5000);
+          flash(ctx.video, "Downloading " + v.label + ", " + gb(v.sizeGB) + " – it will be merged into this scene" + (v.match ? "" : " (imported for you when it finishes)"), 5000);
         } catch (err) {
           alert("Upgrade failed: " + err.message);
         }
@@ -340,12 +417,13 @@ export default function setup(stashui) {
             const sc = await getScene(ctx.id);
             if (requested(sc, c)) return flash(ctx.video, "Upgrade already requested");
             const chk = savedCheck(state.id, state.st);
-            if (chk && !chk.data.error && chk.data.better) return pick(chk.data, chk.at, sc);
+            if (chk && worth(chk.data)) return pick(chk.data, chk.at, sc);
+            const met = !!(state.st && state.st.targetRes && state.st.below === false);
             const found = chk && !chk.data.error ? `\n\nLast check (${ago(chk.at)}) found nothing better - Whisparr will keep looking.` : "";
             const v = await choose(`Upgrade "${sc.title || "this scene"}"?`,
-              "Whisparr will look for a better-quality version. When it downloads, it is merged into this scene, keeping markers, rating and history." + found,
-              [{ label: "⬆  Let Whisparr choose (uses your quality profile)", value: "auto", main: true },
-               { label: "🔍  Search now and pick a release myself", value: "search" },
+              "Whisparr will look for a better-quality version. When it downloads, it is merged into this scene, keeping markers, rating and history." + found + (met ? "\n\n⚠ Your file is already " + state.st.current + ", which meets your Whisparr target (" + state.st.target + "). Whisparr won't download a better version by itself - search now and pick one instead, or raise the cutoff in your quality profile." : ""),
+              [{ label: "⬆  Let Whisparr choose (uses your quality profile)", value: "auto", main: !met },
+               { label: "🔍  Search now and pick a release myself", value: "search", main: met },
                { label: "Cancel", value: null }]);
             if (v === "search") return checkNow();
             if (v === "auto") await requestAuto(sc, c);
